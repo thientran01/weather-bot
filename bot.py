@@ -31,9 +31,6 @@ KALSHI_API_KEY      = os.getenv("KALSHI_API_KEY")
 SENDGRID_API_KEY    = os.getenv("SENDGRID_API_KEY")
 ALERT_FROM_EMAIL    = os.getenv("ALERT_FROM_EMAIL")   # must be verified with SendGrid
 ALERT_TO_EMAIL      = os.getenv("ALERT_TO_EMAIL")
-# Minimum gap (%) required to fire a change-alert email mid-day.
-# Override via WETHR_ALERT_THRESHOLD in .env without touching code.
-ALERT_GAP_THRESHOLD = int(os.getenv("WETHR_ALERT_THRESHOLD", "25"))
 # Set SEND_TEST_EMAIL=true in Railway (or .env) to fire one test email on startup.
 # Remove or set to false after confirming SendGrid is working.
 SEND_TEST_EMAIL     = os.getenv("SEND_TEST_EMAIL", "").lower() == "true"
@@ -262,10 +259,6 @@ NWS_GRID_CACHE = {}
 # Keyed by city_key; value is {"max_observed": int, "date_utc": "YYYY-MM-DD"}.
 # Resets at midnight UTC via reset_running_high_cache().
 RUNNING_HIGH_LAST = {}
-
-# Previous cycle's gap results — used by should_send_change_alert() to detect
-# meaningful shifts between cycles. Structure: {city_key: [gap_dict, ...]}
-PREV_SIGNALS = {}
 
 # ET date on which the morning briefing / evening summary was last sent.
 # Prevents duplicate sends when the bot cycles through the 7:00–7:15 AM or
@@ -1039,16 +1032,16 @@ def format_alert_message(all_results):
     today_active     = [g for g in all_gaps if g["market_date"] == "today" and not g["was_settled"]]
     today_settled    = [g for g in all_gaps if g["market_date"] == "today" and     g["was_settled"]]
 
-    # Apply filter: always show HIGH CONF, only show LOW CONF if |gap| >= 10
-    def should_show(g):
-        return g["confidence"] == "HIGH" or abs(g["gap"]) >= 10
-
+    # Tomorrow: only show markets where NWS is confident (≥65% implied probability).
+    # This drops boundary-zone (55%), lean-NO (35%), and clearly-NO (10%) signals
+    # — those are too noisy when we can't see tomorrow's actual observations yet.
+    # Today: keep HIGH CONF always; LOW CONF only if |gap| >= 10.
     tomorrow_shown = sorted(
-        [g for g in tomorrow_markets if should_show(g)],
+        [g for g in tomorrow_markets if g["nws_prob"] >= 65],
         key=lambda x: abs(x["gap"]), reverse=True,
     )
     today_shown = sorted(
-        [g for g in today_active if should_show(g)],
+        [g for g in today_active if g["confidence"] == "HIGH" or abs(g["gap"]) >= 10],
         key=lambda x: abs(x["gap"]), reverse=True,
     )
 
@@ -1269,104 +1262,6 @@ def _et_now():
     return datetime.now(tz=ZoneInfo("America/New_York"))
 
 
-def should_send_change_alert(all_results):
-    """
-    Compares current cycle's signals against the previous cycle (PREV_SIGNALS).
-
-    Returns (True, [reason_strings]) if something changed significantly enough
-    to warrant an email, or (False, []) if the cycle should run silently.
-
-    Triggers when, for any TOMORROW market that is NOT settled:
-      - A new ticker appeared with |gap| >= ALERT_GAP_THRESHOLD
-      - An existing ticker's gap shifted by >= 10 points AND the new |gap|
-        still meets ALERT_GAP_THRESHOLD (filters out noise near zero)
-    """
-    reasons = []
-
-    for city_key, gaps in all_results.items():
-        prev_by_ticker = {g["ticker"]: g for g in PREV_SIGNALS.get(city_key, [])}
-
-        for g in gaps:
-            if g["was_settled"] or g["market_date"] != "tomorrow":
-                continue
-
-            abs_gap = abs(g["gap"])
-            ticker  = g["ticker"]
-            sign    = "+" if g["gap"] > 0 else ""
-
-            if ticker not in prev_by_ticker:
-                # Brand-new signal this cycle
-                if abs_gap >= ALERT_GAP_THRESHOLD:
-                    reasons.append(
-                        f"NEW signal: {CITIES[city_key]['name']} {g['series_type']} "
-                        f"{g['bucket_label']} — gap {sign}{g['gap']}% ({g['edge']})"
-                    )
-            else:
-                # Existing signal — check for a large gap shift
-                prev_gap = prev_by_ticker[ticker]["gap"]
-                shift    = abs(g["gap"] - prev_gap)
-                if shift >= 10 and abs_gap >= ALERT_GAP_THRESHOLD:
-                    prev_sign = "+" if prev_gap > 0 else ""
-                    reasons.append(
-                        f"GAP SHIFT: {CITIES[city_key]['name']} {g['series_type']} "
-                        f"{g['bucket_label']} — {prev_sign}{prev_gap}% → {sign}{g['gap']}%"
-                    )
-
-    return bool(reasons), reasons
-
-
-def format_change_alert(reasons, all_results):
-    """
-    Compact change-alert email body.
-    Lists what triggered the alert, then shows top tomorrow signals.
-    """
-    now        = _et_now()
-    time_str   = now.strftime("%I:%M %p").lstrip("0")
-    today_date = now.strftime("%b %d")
-    DIVIDER    = "————————————————"
-
-    lines = [
-        f"⚡ Kalshi Alert · {today_date} · {time_str}",
-        "",
-    ]
-
-    for r in reasons:
-        lines.append(f"• {r}")
-
-    lines.append("")
-    lines.append("——— TOP TOMORROW SIGNALS ———")
-    lines.append("")
-
-    # Collect and sort all tomorrow non-settled signals
-    all_tmrw = []
-    for city_key, gaps in all_results.items():
-        for g in gaps:
-            if g["market_date"] == "tomorrow" and not g["was_settled"]:
-                all_tmrw.append({**g, "city_name": CITIES[city_key]["name"], "city_key": city_key})
-
-    all_tmrw.sort(key=lambda x: abs(x["gap"]), reverse=True)
-
-    shown = 0
-    for g in all_tmrw:
-        if abs(g["gap"]) < 10 or shown >= 5:
-            break
-        gap_sign  = "+" if g["gap"] > 0 else ""
-        edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-        lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
-        lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
-        lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF")
-        lines.append(DIVIDER)
-        shown += 1
-
-    if shown == 0:
-        lines.append("No signals above 10% gap currently.")
-        lines.append("")
-
-    lines.append("──────────────────────")
-    lines.append("Not financial advice.")
-
-    return "\n".join(lines)
-
 
 def format_evening_summary(all_results):
     """
@@ -1394,7 +1289,7 @@ def format_evening_summary(all_results):
                 all_tmrw.append({**g, "city_name": CITIES[city_key]["name"], "city_key": city_key})
 
     all_tmrw.sort(key=lambda x: abs(x["gap"]), reverse=True)
-    shown_tmrw = [g for g in all_tmrw if g["confidence"] == "HIGH" or abs(g["gap"]) >= 10]
+    shown_tmrw = [g for g in all_tmrw if g["nws_prob"] >= 65]
 
     if shown_tmrw:
         for g in shown_tmrw[:10]:
@@ -1455,12 +1350,12 @@ def run_cycle():
     After all cities, decides what (if anything) to email:
       • 7:00–7:14 AM ET → morning briefing (full signal list, once per day)
       • 8:00–8:14 PM ET → evening summary  (top signals + today's highs, once)
-      • Otherwise       → change alert only if a new/shifted signal appeared
+      • Otherwise       → silent (intraday alerts come from running-high check)
       • Always          → log_to_csv() and heartbeat print
 
     If a city fails at any step it is skipped; all other cities continue.
     """
-    global PREV_SIGNALS, _MORNING_SENT_DATE, _EVENING_SENT_DATE
+    global _MORNING_SENT_DATE, _EVENING_SENT_DATE
 
     cycle_start   = time.time()
     all_results   = {}
@@ -1521,24 +1416,12 @@ def run_cycle():
             log.info("Evening summary sent.")
 
         else:
-            # ── Daytime: only email if something meaningful changed ──────────
-            changed, reasons = should_send_change_alert(all_results)
-            if changed:
-                message = format_change_alert(reasons, all_results)
-                send_email(
-                    message,
-                    subject=(
-                        f"⚡ Kalshi Alert — "
-                        f"{et.strftime('%b %d')} {et.strftime('%I:%M %p').lstrip('0')}"
-                    ),
-                )
-                log.info(f"Change alert sent ({len(reasons)} trigger(s)).")
-            else:
-                log.info("No significant changes — cycle silent (no email).")
+            # ── Daytime: silent cycle ────────────────────────────────────────
+            # Intraday emails only fire when a running high crosses a bucket
+            # boundary — that's handled by check_running_high_alerts() every 2 min.
+            log.info("Daytime cycle complete — no email (intraday alerts from running-high check).")
 
-        # Always log to CSV and update PREV_SIGNALS for next cycle's comparison
         log_to_csv(all_results)
-        PREV_SIGNALS = {k: list(v) for k, v in all_results.items()}
 
     else:
         log.warning("No city data collected this cycle — email and CSV skipped.")
@@ -1569,15 +1452,20 @@ def check_running_high_alerts():
     """
     Lightweight check that runs every 2 minutes.
 
-    For each city, fetches the current running high (observed since midnight
-    LST) and compares it to the last recorded peak in RUNNING_HIGH_LAST.
-    If a city sets a new peak, it's collected and a brief alert email is sent.
+    For each city that sets a new running high, looks at every active TODAY
+    HIGH market and checks whether the new temperature newly entered the ±1°F
+    zone around any bucket boundary (floor or cap).
 
-    First observation of the day (no prior entry) is recorded silently — we
-    don't alert on first contact, only on subsequent new peaks.
+    "Newly entered" means old_max was outside the ±1°F zone and new_max is
+    inside it — so each boundary crossing fires at most once per degree of
+    approach, and generic temp-change noise is suppressed entirely.
+
+    Alert format per market:
+      📍 Houston: 80°F crosses into 79-80°F boundary — Kalshi 22% → NWS 75%
     """
-    new_peaks  = []   # list of (city_key, new_high, old_high)
     today_utc  = datetime.utcnow().strftime("%Y-%m-%d")
+    today_date = datetime.now().date()
+    crossings  = []   # formatted alert strings, one per boundary approach
 
     for city_key in CITIES:
         try:
@@ -1588,36 +1476,97 @@ def check_running_high_alerts():
             new_max = result["max_observed"]
             last    = RUNNING_HIGH_LAST.get(city_key, {})
 
-            # If this is the first reading of a new UTC day, record it silently
-            # (the prior day's peak is no longer meaningful)
+            # First reading of a new UTC day — record silently, no alert
             if last.get("date_utc") != today_utc:
-                RUNNING_HIGH_LAST[city_key] = {
-                    "max_observed": new_max,
-                    "date_utc":     today_utc,
-                }
+                RUNNING_HIGH_LAST[city_key] = {"max_observed": new_max, "date_utc": today_utc}
                 continue
 
             old_max = last["max_observed"]
+            if new_max <= old_max:
+                continue  # no new high this check
 
-            if new_max > old_max:
-                # New peak! Record it and queue an alert
-                new_peaks.append((city_key, new_max, old_max))
-                RUNNING_HIGH_LAST[city_key]["max_observed"] = new_max
-                log.info(f"[{city_key}] New running high: {old_max}°F → {new_max}°F")
+            # Record the new peak before checking markets
+            RUNNING_HIGH_LAST[city_key]["max_observed"] = new_max
+            log.info(f"[{city_key}] New running high: {old_max}°F → {new_max}°F")
+
+            # Check this city's active HIGH markets for today only
+            city_name    = CITIES[city_key]["name"]
+            station_type = CITIES[city_key]["station_type"]
+            markets      = fetch_kalshi_markets(city_key)
+
+            for m in markets:
+                if m["series_type"] != "HIGH":
+                    continue
+
+                # Only today's markets (running high = today's observation)
+                date_part = m["event_ticker"].split("-")[-1]
+                try:
+                    market_date = datetime.strptime(date_part, "%y%b%d").date()
+                except ValueError:
+                    continue
+                if market_date != today_date:
+                    continue
+
+                # Each market has up to two boundaries (floor and/or cap)
+                boundaries = []
+                if m["floor"] is not None:
+                    boundaries.append(m["floor"])
+                if m["cap"] is not None:
+                    boundaries.append(m["cap"])
+
+                for boundary_val in boundaries:
+                    new_near = abs(new_max - boundary_val) <= 1
+                    old_near = abs(old_max - boundary_val) <= 1
+
+                    # Only alert when we newly enter the ±1°F zone around this boundary
+                    if not new_near or old_near:
+                        continue
+
+                    nws_prob    = calculate_nws_probability(
+                        new_max, m["bucket_type"], m["floor"], m["cap"], station_type,
+                    )
+                    kalshi_prob = m["kalshi_prob"]
+                    bucket      = _bucket_label(m)
+
+                    # "crosses" = new_max is on the YES side of the boundary;
+                    # "approaches" = still on the NO side but within 1°F
+                    if m["bucket_type"] == "FLOOR":
+                        on_yes_side = new_max > m["floor"]
+                    elif m["bucket_type"] == "CAP":
+                        on_yes_side = new_max < m["cap"]
+                    else:  # RANGE
+                        on_yes_side = m["floor"] <= new_max <= m["cap"]
+                    action = "crosses into" if on_yes_side else "approaches"
+
+                    crossings.append(
+                        f"📍 {city_name}: {new_max}°F {action} {bucket} boundary"
+                        f" — Kalshi {kalshi_prob}% → NWS {nws_prob}%"
+                    )
+                    log.info(
+                        f"[{city_key}] Boundary {action}: {new_max}°F near {bucket} "
+                        f"(Kalshi {kalshi_prob}%, NWS {nws_prob}%)"
+                    )
 
         except Exception as e:
-            log.error(f"[{city_key}] Running high alert check failed: {e}")
+            log.error(f"[{city_key}] Running high check failed: {e}")
 
-    if new_peaks:
-        lines = ["🌡️ NEW HIGH ALERT\n"]
-        for city_key, new_high, old_high in new_peaks:
-            city_name = CITIES[city_key]["name"]
-            lines.append(f"📍 {city_name}: {old_high}°F → {new_high}°F (new running high)")
-        lines.append("\nCheck Kalshi for any boundary markets that may have shifted.")
-        send_email("\n".join(lines))
-        log.info(f"New high alert sent for: {[p[0] for p in new_peaks]}")
+    if crossings:
+        now  = datetime.now()
+        body = "\n".join([
+            f"🌡️ RUNNING HIGH ALERT · {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
+            "",
+            *crossings,
+            "",
+            "Check Kalshi for these markets.",
+            "Not financial advice.",
+        ])
+        send_email(
+            body,
+            subject=f"🌡️ Running High Alert — {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
+        )
+        log.info(f"Running high boundary alert sent ({len(crossings)} crossing(s)).")
     else:
-        log.debug("Running high check: no new peaks detected.")
+        log.debug("Running high check: no boundary crossings detected.")
 
 
 def reset_running_high_cache():
@@ -1657,7 +1606,7 @@ if __name__ == "__main__":
     log.info(f"  Gap-analysis cycle every {RUN_EVERY_MINUTES} min (silent unless triggered)")
     log.info( "  Email schedule (America/New_York):")
     log.info( "    ☀️  7:00 AM — morning briefing (full signal list)")
-    log.info(f"    ⚡  Daytime — change alert if gap ≥ {ALERT_GAP_THRESHOLD}% or shift ≥ 10pt")
+    log.info( "    ⚡  Intraday — running-high boundary alert (2-min check, boundary ±1°F)")
     log.info( "    🌙  8:00 PM — evening summary (top signals + today's highs)")
     log.info( "  Running-high alert check every 2 minutes")
     log.info( "  Running-high cache reset at midnight UTC")
