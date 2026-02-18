@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Credentials
+.env
+kalshi_private_key.pem
+
+# Bot data
+log.csv
+*.csv
