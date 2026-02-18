@@ -43,6 +43,10 @@ SEND_TEST_EMAIL     = os.getenv("SEND_TEST_EMAIL", "").lower() == "true"
 # The Kalshi REST API base URL (confirmed — all markets live here, no auth needed for reads)
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Cities that get full signal cards in email alerts (historically more reliable markets).
+# All other cities still run, log to CSV, and appear in a collapsed "Other Cities" section.
+TIER1_CITIES = {"PHX", "MIA", "LAS", "HOU", "SAT", "DAL"}
+
 # Each city entry contains:
 #   name         — display name for alerts
 #   nws_station  — ICAO station code Kalshi uses for official resolution (CRITICAL: wrong
@@ -1126,7 +1130,14 @@ def format_alert_message(all_results):
         key=lambda x: abs(x["gap"]), reverse=True,
     )
 
-    # Summary stats
+    # Split each period's signals into Tier 1 (full cards) and Other Cities (collapsed).
+    # Filters are already applied — this only affects display, not which markets show up.
+    tier1_tmrw  = [g for g in tomorrow_shown if g["city_key"] in TIER1_CITIES]
+    other_tmrw  = [g for g in tomorrow_shown if g["city_key"] not in TIER1_CITIES]
+    tier1_today = [g for g in today_shown    if g["city_key"] in TIER1_CITIES]
+    other_today = [g for g in today_shown    if g["city_key"] not in TIER1_CITIES]
+
+    # Summary stats (counts across all cities, Tier 1 + Other)
     actionable = [g for g in tomorrow_shown + today_shown if abs(g["gap"]) > 15]
     top        = tomorrow_shown[0] if tomorrow_shown else (today_shown[0] if today_shown else None)
     if top:
@@ -1135,12 +1146,10 @@ def format_alert_message(all_results):
     else:
         top_str = "—"
 
-    # Card separator — short enough to read on narrow screens
     DIVIDER = "————————————————"
+    lines   = []
 
-    lines = []
-
-    # ── HEADER (2 lines) ─────────────────────────────────
+    # ── HEADER ───────────────────────────────────────────
     lines.append(f"🤖 Kalshi Bot · {today_date} · {time_str}")
     lines.append(f"{len(all_gaps)} markets · {len(actionable)} signals · Top: {top_str}")
     lines.append("")
@@ -1149,8 +1158,9 @@ def format_alert_message(all_results):
     lines.append(f"——— TOMORROW {tomorrow_date} ———")
     lines.append("")
 
-    if tomorrow_shown:
-        for g in tomorrow_shown:
+    # Tier 1: full 3-line cards
+    if tier1_tmrw:
+        for g in tier1_tmrw:
             gap_sign  = "+" if g["gap"] > 0 else ""
             edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
             liq_tag   = " ⚠️ LOW LIQUIDITY" if g["kalshi_prob"] == 1 else ""
@@ -1158,15 +1168,26 @@ def format_alert_message(all_results):
             lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
             lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF{liq_tag}")
             lines.append(DIVIDER)
-    else:
+    elif not other_tmrw:
         lines.append("No signals for tomorrow.")
         lines.append("")
 
-    # ── TODAY ACTIVE (if any passed the filter) ───────────
-    if today_shown:
+    # Other Cities: one collapsed line each (gap + direction only)
+    if other_tmrw:
+        lines.append("· Other Cities (Tomorrow)")
+        for g in other_tmrw:
+            gap_sign  = "+" if g["gap"] > 0 else ""
+            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
+            lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
+        lines.append("")
+
+    # ── TODAY ACTIVE ──────────────────────────────────────
+    if tier1_today or other_today:
         lines.append(f"——— TODAY {today_date} ———")
         lines.append("")
-        for g in today_shown:
+
+        # Tier 1: full cards
+        for g in tier1_today:
             gap_sign  = "+" if g["gap"] > 0 else ""
             edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
             liq_tag   = " ⚠️ LOW LIQUIDITY" if g["kalshi_prob"] == 1 else ""
@@ -1174,6 +1195,15 @@ def format_alert_message(all_results):
             lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
             lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF{liq_tag}")
             lines.append(DIVIDER)
+
+        # Other Cities: collapsed
+        if other_today:
+            lines.append("· Other Cities (Today)")
+            for g in other_today:
+                gap_sign  = "+" if g["gap"] > 0 else ""
+                edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
+                lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
+            lines.append("")
 
     # ── TODAY SETTLED (collapsed — no details needed) ─────
     if today_settled:
@@ -1407,25 +1437,40 @@ def format_evening_summary(all_results):
     all_tmrw.sort(key=lambda x: abs(x["gap"]), reverse=True)
     shown_tmrw = [g for g in all_tmrw if g["nws_prob"] >= 65]
 
-    if shown_tmrw:
-        for g in shown_tmrw[:10]:
+    tier1_tmrw = [g for g in shown_tmrw if g["city_key"] in TIER1_CITIES]
+    other_tmrw = [g for g in shown_tmrw if g["city_key"] not in TIER1_CITIES]
+
+    # Tier 1: full cards
+    if tier1_tmrw:
+        for g in tier1_tmrw:
             gap_sign  = "+" if g["gap"] > 0 else ""
             edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
             lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
             lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
             lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF")
             lines.append(DIVIDER)
-    else:
+    elif not other_tmrw:
         lines.append("No significant signals for tomorrow.")
         lines.append("")
 
-    # Today's observed running highs (one line per city that has data)
+    # Other Cities: collapsed one-liners
+    if other_tmrw:
+        lines.append("· Other Cities")
+        for g in other_tmrw:
+            gap_sign  = "+" if g["gap"] > 0 else ""
+            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
+            lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
+        lines.append("")
+
+    # Today's observed running highs — Tier 1 first, then other cities
     lines.append(f"——— TODAY'S OBSERVED HIGHS ———")
     lines.append("")
 
-    for city_key, gaps in all_results.items():
+    tier1_keys = [k for k in all_results if k in TIER1_CITIES]
+    other_keys = [k for k in all_results if k not in TIER1_CITIES]
+    for city_key in tier1_keys + other_keys:
         city_name = CITIES[city_key]["name"]
-        for g in gaps:
+        for g in all_results[city_key]:
             if g["market_date"] != "today" or g["series_type"] != "HIGH":
                 continue
             ft  = g.get("forecast_temp")
