@@ -249,7 +249,7 @@ RUN_EVERY_MINUTES = 10
 MIN_GAP_TO_SHOW = 0
 
 # CSV log file path
-LOG_FILE = "log.csv"
+LOG_FILE = os.getenv("LOG_PATH", "log.csv")
 
 # Cache for NWS grid info (office, gridX, gridY) so we only look it up once
 # per city at startup rather than on every 10-minute cycle.
