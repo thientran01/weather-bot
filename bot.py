@@ -13,11 +13,9 @@ import os
 import csv
 import math
 import time
-import smtplib
 import logging
 import schedule
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import requests
@@ -30,8 +28,8 @@ import requests
 load_dotenv()
 
 KALSHI_API_KEY      = os.getenv("KALSHI_API_KEY")
-GMAIL_ADDRESS       = os.getenv("GMAIL_ADDRESS")
-GMAIL_PASSWORD      = os.getenv("GMAIL_APP_PASSWORD")
+SENDGRID_API_KEY    = os.getenv("SENDGRID_API_KEY")
+ALERT_FROM_EMAIL    = os.getenv("ALERT_FROM_EMAIL")   # must be verified with SendGrid
 ALERT_TO_EMAIL      = os.getenv("ALERT_TO_EMAIL")
 # Minimum gap (%) required to fire a change-alert email mid-day.
 # Override via WETHR_ALERT_THRESHOLD in .env without touching code.
@@ -1118,15 +1116,15 @@ def format_alert_message(all_results):
 
 def send_email(message, subject=None):
     """
-    Sends the formatted alert as a plain-text email via Gmail SMTP.
-    Uses App Password auth (set GMAIL_APP_PASSWORD in .env).
+    Sends the formatted alert as a plain-text email via SendGrid's HTTP API.
+    Uses SENDGRID_API_KEY for authentication (set it in Railway env vars).
     Logs any error and continues — email failure never crashes the bot.
 
     subject — optional custom subject line. If omitted, falls back to the
               generic timestamped default (used by check_running_high_alerts).
     """
-    if not all([GMAIL_ADDRESS, GMAIL_PASSWORD, ALERT_TO_EMAIL]):
-        log.warning("Gmail credentials missing in .env — skipping email.")
+    if not all([SENDGRID_API_KEY, ALERT_FROM_EMAIL, ALERT_TO_EMAIL]):
+        log.warning("SendGrid credentials missing in env — skipping email.")
         return
 
     if subject is None:
@@ -1134,21 +1132,26 @@ def send_email(message, subject=None):
         subject = f"Kalshi Climate Bot — {now.strftime('%b %d')} {now.strftime('%I:%M %p')}"
 
     try:
-        msg            = MIMEText(message, "plain")
-        msg["Subject"] = subject
-        msg["From"]    = GMAIL_ADDRESS
-        msg["To"]      = ALERT_TO_EMAIL
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_ADDRESS, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_ADDRESS, ALERT_TO_EMAIL, msg.as_string())
-
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": ALERT_TO_EMAIL}]}],
+                "from":            {"email": ALERT_FROM_EMAIL},
+                "subject":         subject,
+                "content":         [{"type": "text/plain", "value": message}],
+            },
+            timeout=15,
+        )
+        # SendGrid returns 202 Accepted on success (no body)
+        response.raise_for_status()
         log.info(f"Email sent → {ALERT_TO_EMAIL}  |  Subject: {subject}")
 
-    except smtplib.SMTPAuthenticationError:
-        log.error("Gmail auth failed — check GMAIL_APP_PASSWORD in .env.")
+    except requests.exceptions.HTTPError as e:
+        log.error(f"SendGrid HTTP error: {e.response.status_code} — {e.response.text}")
     except Exception as e:
         log.error(f"Email send failed: {e}")
 

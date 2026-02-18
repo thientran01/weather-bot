@@ -17,7 +17,7 @@ I am a beginner. Always:
 - Python 3
 - Kalshi REST API (read-only market data)
 - api.weather.gov (NWS) — free, no API key needed
-- Gmail SMTP for text/email alerts
+- SendGrid HTTP API for email alerts
 - .env file for all credentials
 
 ## Cities
