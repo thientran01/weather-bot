@@ -1290,15 +1290,18 @@ def log_to_csv(all_results, all_forecasts):
       nws_forecast       — raw NWS grid forecast temp for this market's period (°F)
       openmeteo_forecast — Open-Meteo ECMWF forecast temp for this period (°F)
       model_agreement    — True if within 1°F, False if ≥3°F apart, blank if in between
+      ticker             — Kalshi market ticker (used by resolve.py for result lookup)
+      market_date        — "today" or "tomorrow" from the signal's perspective
 
-    NOTE: If log.csv already exists with the old schema (10 columns), delete it and
-    let the bot recreate it with the new 13-column header on the next cycle.
+    NOTE: If log.csv already exists with an older schema, delete it and let the
+    bot recreate it with the current 15-column header on the next cycle.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
         "nws_forecast", "openmeteo_forecast", "model_agreement",
+        "ticker", "market_date",
     ]
 
     now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1351,6 +1354,8 @@ def log_to_csv(all_results, all_forecasts):
                         "nws_forecast":       nws_temp if nws_temp is not None else "",
                         "openmeteo_forecast": om_temp  if om_temp  is not None else "",
                         "model_agreement":    agreement,
+                        "ticker":             g["ticker"],
+                        "market_date":        g["market_date"],
                     })
                     total_rows += 1
 
