@@ -1,0 +1,8 @@
+# Install with: pip install -r requirements.txt
+# Requires Python 3.9+ (for zoneinfo, which is stdlib in 3.9+)
+
+requests==2.31.0        # HTTP calls to Kalshi API and NWS weather API
+python-dotenv==1.0.0    # Local dev only: loads credentials from .env file.
+                        # On Railway, env vars are injected directly — load_dotenv()
+                        # is a no-op when .env is absent, so this is safe to keep.
+schedule==1.2.1         # Repeating timer (run_cycle every 10 min, etc.)
