@@ -34,6 +34,7 @@ ALERT_TO_EMAIL      = os.getenv("ALERT_TO_EMAIL")
 # Set SEND_TEST_EMAIL=true in Railway (or .env) to fire one test email on startup.
 # Remove or set to false after confirming SendGrid is working.
 SEND_TEST_EMAIL     = os.getenv("SEND_TEST_EMAIL", "").lower() == "true"
+WEATHERAPI_KEY      = os.getenv("WEATHERAPI_KEY")   # weatherapi.com — free tier is sufficient
 
 # ============================================================
 # SECTION 2 — CONFIGURATION
@@ -258,11 +259,11 @@ LOG_FILE = os.getenv("LOG_PATH", "log.csv")
 # Format: {"NYC": {"office": "OKX", "grid_x": 33, "grid_y": 37, "forecast_url": "..."}}
 NWS_GRID_CACHE = {}
 
-# Tracks the highest running temperature seen for each city during the current day.
-# Used by check_running_high_alerts() to detect when a new peak is set.
-# Keyed by city_key; value is {"max_observed": int, "date_utc": "YYYY-MM-DD"}.
-# Resets at midnight UTC via reset_running_high_cache().
-RUNNING_HIGH_LAST = {}
+# Tracks markets whose model spread was ≥ 3°F in any cycle today.
+# When a flagged market's spread later drops below 1°F, an intraday alert fires.
+# Both sets reset at midnight UTC so each day starts fresh.
+_HIGH_SPREAD_FLAGGED = set()   # tickers that have seen spread ≥ 3°F today
+_SPREAD_ALERTED      = set()   # tickers that already got a convergence alert today
 
 # ET date on which the morning briefing / evening summary was last sent.
 # Prevents duplicate sends when the bot cycles through the 7:00–7:15 AM or
@@ -785,27 +786,23 @@ def get_current_running_high(city_key):
 
 
 # ============================================================
-# SECTION 5c — OPEN-METEO FORECAST
-# Second forecast source for cross-validation with NWS.
-# Free, no API key, uses the ECMWF model via daily high/low endpoint.
-# Failure here is non-fatal — NWS still drives all signal logic.
+# SECTION 5c — MULTI-MODEL FORECASTS
+# Three additional forecast sources for cross-validation with NWS.
+# All are non-fatal — failure here never skips a city or blocks
+# the main cycle. NWS still drives all signal logic.
+#
+# Sources:
+#   Open-Meteo ECMWF  (ecmwf_ifs04)  — free, no key
+#   Open-Meteo GFS    (gfs_seamless)  — free, no key
+#   WeatherAPI.com                    — requires WEATHERAPI_KEY
 # ============================================================
 
-def fetch_openmeteo_forecast(city_key):
+def _fetch_openmeteo_model(city_key, model):
     """
-    Fetches today's and tomorrow's high/low temperature forecast from
-    Open-Meteo (https://open-meteo.com). Free, no API key required.
-    Uses the ECMWF model with daily max/min temperatures in Fahrenheit.
+    Shared helper for Open-Meteo model fetches.
+    Calls the Open-Meteo daily forecast API with a specific model parameter.
 
-    Returns a dict in the same shape as fetch_nws_forecast():
-    {
-        "today_high":    47,   # daily max °F, rounded to nearest int
-        "today_low":     32,
-        "tomorrow_high": 55,
-        "tomorrow_low":  38,
-    }
-
-    Returns None on any failure — never crashes or blocks the main cycle.
+    Returns {today_high, today_low, tomorrow_high, tomorrow_low} or None on failure.
     """
     city = CITIES[city_key]
 
@@ -817,30 +814,25 @@ def fetch_openmeteo_forecast(city_key):
                 "longitude":        city["lon"],
                 "daily":            "temperature_2m_max,temperature_2m_min",
                 "temperature_unit": "fahrenheit",
-                "timezone":         "auto",   # use the city's local timezone
-                "forecast_days":    2,         # today + tomorrow only
+                "timezone":         "auto",
+                "forecast_days":    2,
+                "models":           model,
             },
             timeout=10,
         )
         response.raise_for_status()
         data = response.json()
 
-        times = data["daily"]["time"]                 # ["2026-02-18", "2026-02-19"]
-        highs = data["daily"]["temperature_2m_max"]   # [45.2, 52.1]
-        lows  = data["daily"]["temperature_2m_min"]   # [32.5, 38.7]
+        times = data["daily"]["time"]
+        highs = data["daily"]["temperature_2m_max"]
+        lows  = data["daily"]["temperature_2m_min"]
 
         today    = datetime.now().strftime("%Y-%m-%d")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        result = {
-            "today_high":    None,
-            "today_low":     None,
-            "tomorrow_high": None,
-            "tomorrow_low":  None,
-        }
+        result = {"today_high": None, "today_low": None, "tomorrow_high": None, "tomorrow_low": None}
 
         for i, date_str in enumerate(times):
-            # Round to the nearest whole degree for apples-to-apples comparison with NWS
             high = round(highs[i]) if highs[i] is not None else None
             low  = round(lows[i])  if lows[i]  is not None else None
             if date_str == today:
@@ -851,18 +843,128 @@ def fetch_openmeteo_forecast(city_key):
                 result["tomorrow_low"]  = low
 
         log.info(
-            f"[{city_key}] Open-Meteo: "
+            f"[{city_key}] Open-Meteo ({model}): "
             f"today {result['today_high']}°F/{result['today_low']}°F, "
             f"tomorrow {result['tomorrow_high']}°F/{result['tomorrow_low']}°F"
         )
         return result
 
     except requests.exceptions.RequestException as e:
-        log.error(f"[{city_key}] Open-Meteo request failed: {e}")
+        log.error(f"[{city_key}] Open-Meteo ({model}) request failed: {e}")
         return None
     except Exception as e:
-        log.error(f"[{city_key}] Unexpected error in Open-Meteo fetch: {e}")
+        log.error(f"[{city_key}] Unexpected error in Open-Meteo ({model}) fetch: {e}")
         return None
+
+
+def fetch_ecmwf_forecast(city_key):
+    """Fetches the ECMWF IFS 0.4° model forecast from Open-Meteo. Free, no key needed."""
+    return _fetch_openmeteo_model(city_key, "ecmwf_ifs04")
+
+
+def fetch_gfs_forecast(city_key):
+    """Fetches the GFS Seamless model forecast from Open-Meteo. Free, no key needed."""
+    return _fetch_openmeteo_model(city_key, "gfs_seamless")
+
+
+def fetch_weatherapi_forecast(city_key):
+    """
+    Fetches today's and tomorrow's high/low temperature forecast from WeatherAPI.com.
+    Requires WEATHERAPI_KEY in env vars (free tier is sufficient — 1M calls/month).
+
+    Returns {today_high, today_low, tomorrow_high, tomorrow_low} or None on failure.
+    """
+    if not WEATHERAPI_KEY:
+        return None
+
+    city = CITIES[city_key]
+
+    try:
+        response = requests.get(
+            "https://api.weatherapi.com/v1/forecast.json",
+            params={
+                "key":    WEATHERAPI_KEY,
+                "q":      f"{city['lat']},{city['lon']}",
+                "days":   2,
+                "aqi":    "no",
+                "alerts": "no",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        days   = data["forecast"]["forecastday"]   # list of up to 2 items: today + tomorrow
+        result = {"today_high": None, "today_low": None, "tomorrow_high": None, "tomorrow_low": None}
+
+        if len(days) >= 1:
+            result["today_high"] = round(days[0]["day"]["maxtemp_f"])
+            result["today_low"]  = round(days[0]["day"]["mintemp_f"])
+        if len(days) >= 2:
+            result["tomorrow_high"] = round(days[1]["day"]["maxtemp_f"])
+            result["tomorrow_low"]  = round(days[1]["day"]["mintemp_f"])
+
+        log.info(
+            f"[{city_key}] WeatherAPI: "
+            f"today {result['today_high']}°F/{result['today_low']}°F, "
+            f"tomorrow {result['tomorrow_high']}°F/{result['tomorrow_low']}°F"
+        )
+        return result
+
+    except requests.exceptions.RequestException as e:
+        log.error(f"[{city_key}] WeatherAPI request failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"[{city_key}] Unexpected error in WeatherAPI fetch: {e}")
+        return None
+
+
+def _get_model_data(city_key, g, all_forecasts):
+    """
+    Pulls forecast temperatures from all models for a single market gap result.
+
+    Returns a dict with:
+      nws_temp / ecmwf_temp / gfs_temp / wapi_temp — °F ints or None
+      spread          — max−min across all available models (°F int or None)
+      models_line     — pre-formatted "Models: NWS 79° | ECMWF 78° | ..." string
+      has_enough_data — True only if NWS and at least one other model are present
+    """
+    fc_key = f"{g['market_date']}_{g['series_type'].lower()}"   # e.g. "today_high"
+
+    forecasts  = all_forecasts.get(city_key, {})
+    nws_temp   = (forecasts.get("nws")        or {}).get(fc_key)
+    ecmwf_temp = (forecasts.get("ecmwf")      or {}).get(fc_key)
+    gfs_temp   = (forecasts.get("gfs")        or {}).get(fc_key)
+    wapi_temp  = (forecasts.get("weatherapi") or {}).get(fc_key)
+
+    # Require NWS + at least one other model for a market to be shown
+    other_temps     = [t for t in [ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+    has_enough_data = nws_temp is not None and len(other_temps) >= 1
+
+    # Build the models line parts
+    parts = []
+    if nws_temp   is not None: parts.append(f"NWS {nws_temp}°")
+    if ecmwf_temp is not None: parts.append(f"ECMWF {ecmwf_temp}°")
+    if gfs_temp   is not None: parts.append(f"GFS {gfs_temp}°")
+    if wapi_temp  is not None: parts.append(f"WAPI {wapi_temp}°")
+
+    all_temps = [t for t in [nws_temp, ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+    spread    = (max(all_temps) - min(all_temps)) if len(all_temps) >= 2 else None
+
+    if spread is not None:
+        parts.append(f"Spread: {spread}°")
+
+    models_line = "Models: " + " | ".join(parts) if parts else "Models: N/A"
+
+    return {
+        "nws_temp":        nws_temp,
+        "ecmwf_temp":      ecmwf_temp,
+        "gfs_temp":        gfs_temp,
+        "wapi_temp":       wapi_temp,
+        "spread":          spread,
+        "models_line":     models_line,
+        "has_enough_data": has_enough_data,
+    }
 
 
 def calculate_nws_probability(forecast_temp, bucket_type, floor, cap, station_type):
@@ -1084,139 +1186,79 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast):
 # it via Twilio SMS and/or Gmail email.
 # ============================================================
 
-def format_alert_message(all_results):
+def format_alert_message(all_results, all_forecasts):
     """
-    Formats all gap analysis results into a mobile-first plain-text email.
+    Formats all markets into a plain-text email using model temperature cards.
 
-    all_results: dict  {city_key: [gap_result, ...]}  from run_cycle()
+    Card format per market:
+      📍 CITY NAME — TYPE bucket_label
+      Kalshi: X%
+      Models: NWS Y° | ECMWF Z° | GFS W° | WAPI V° | Spread: N°
+      ⚠️ HIGH SPREAD   (appended to models line only if spread ≥ 3°F)
 
-    Each market renders as a compact 3-line card:
-      📍 CITY — TYPE bucket_label
-      Kalshi X% → NWS Y% | Gap: +/-Z%
-      ✅/🔴 BUY YES/NO | HIGH/LOW CONF  [⚠️ LOW LIQUIDITY]
-
-    Filtering rules:
-      - HIGH CONF markets always shown (regardless of gap size)
-      - LOW CONF markets only shown if |gap| >= 10% (filter out noise)
-      - SETTLED markets collapsed to one line each (no gap details)
+    Filtering: only markets where NWS + at least one other model have data.
+    Sort: Tier 1 cities first, then all others — each group sorted by Kalshi
+    price ascending (lowest price = most potentially underpriced).
     """
     now           = datetime.now()
     today_date    = now.strftime("%b %d")
     tomorrow_date = (now + timedelta(days=1)).strftime("%b %d")
-    time_str      = now.strftime("%I:%M %p").lstrip("0")  # "9:00 PM" not "09:00 PM"
+    time_str      = now.strftime("%I:%M %p").lstrip("0")
+    DIVIDER       = "————————————————"
 
-    # Flatten all results, attaching city key and display name for rendering
-    all_gaps = []
-    for city_key, gaps in all_results.items():
-        city_name = CITIES[city_key]["name"]
-        for g in gaps:
-            all_gaps.append({**g, "city_name": city_name, "city_key": city_key})
+    def build_market_list(date_filter):
+        """Builds and sorts the filtered market list for one date period."""
+        markets = []
+        for city_key, gaps in all_results.items():
+            city_name = CITIES[city_key]["name"]
+            for g in gaps:
+                if g["market_date"] != date_filter:
+                    continue
+                md = _get_model_data(city_key, g, all_forecasts)
+                if not md["has_enough_data"]:
+                    continue
+                markets.append({**g, "city_name": city_name, "city_key": city_key, **md})
+        # Tier 1 first, then by Kalshi price ascending within each tier group
+        markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, x["kalshi_prob"]))
+        return markets
 
-    # Split into rendering buckets
-    tomorrow_markets = [g for g in all_gaps if g["market_date"] == "tomorrow"]
-    today_active     = [g for g in all_gaps if g["market_date"] == "today" and not g["was_settled"]]
-    today_settled    = [g for g in all_gaps if g["market_date"] == "today" and     g["was_settled"]]
+    def render_markets(market_list):
+        """Renders a list of markets as card lines."""
+        card_lines = []
+        for g in market_list:
+            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 3) else ""
+            card_lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
+            card_lines.append(f"Kalshi: {g['kalshi_prob']}%")
+            card_lines.append(g["models_line"] + spread_tag)
+            card_lines.append(DIVIDER)
+        return card_lines
 
-    # Tomorrow: only show markets where NWS is confident (≥65% implied probability).
-    # This drops boundary-zone (55%), lean-NO (35%), and clearly-NO (10%) signals
-    # — those are too noisy when we can't see tomorrow's actual observations yet.
-    # Today: keep HIGH CONF always; LOW CONF only if |gap| >= 10.
-    tomorrow_shown = sorted(
-        [g for g in tomorrow_markets if g["nws_prob"] >= 65],
-        key=lambda x: abs(x["gap"]), reverse=True,
-    )
-    today_shown = sorted(
-        [g for g in today_active if g["confidence"] == "HIGH" or abs(g["gap"]) >= 10],
-        key=lambda x: abs(x["gap"]), reverse=True,
-    )
+    tomorrow_markets = build_market_list("tomorrow")
+    today_markets    = build_market_list("today")
+    total            = len(tomorrow_markets) + len(today_markets)
 
-    # Split each period's signals into Tier 1 (full cards) and Other Cities (collapsed).
-    # Filters are already applied — this only affects display, not which markets show up.
-    tier1_tmrw  = [g for g in tomorrow_shown if g["city_key"] in TIER1_CITIES]
-    other_tmrw  = [g for g in tomorrow_shown if g["city_key"] not in TIER1_CITIES]
-    tier1_today = [g for g in today_shown    if g["city_key"] in TIER1_CITIES]
-    other_today = [g for g in today_shown    if g["city_key"] not in TIER1_CITIES]
-
-    # Summary stats (counts across all cities, Tier 1 + Other)
-    actionable = [g for g in tomorrow_shown + today_shown if abs(g["gap"]) > 15]
-    top        = tomorrow_shown[0] if tomorrow_shown else (today_shown[0] if today_shown else None)
-    if top:
-        gap_sign = "+" if top["gap"] > 0 else ""
-        top_str  = f"{top['city_key']} {top['series_type']} {gap_sign}{top['gap']}%"
-    else:
-        top_str = "—"
-
-    DIVIDER = "————————————————"
-    lines   = []
-
-    # ── HEADER ───────────────────────────────────────────
+    lines = []
     lines.append(f"🤖 Kalshi Bot · {today_date} · {time_str}")
-    lines.append(f"{len(all_gaps)} markets · {len(actionable)} signals · Top: {top_str}")
+    lines.append(f"{total} markets shown")
     lines.append("")
 
     # ── TOMORROW ─────────────────────────────────────────
     lines.append(f"——— TOMORROW {tomorrow_date} ———")
     lines.append("")
-
-    # Tier 1: full 3-line cards
-    if tier1_tmrw:
-        for g in tier1_tmrw:
-            gap_sign  = "+" if g["gap"] > 0 else ""
-            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-            liq_tag   = " ⚠️ LOW LIQUIDITY" if g["kalshi_prob"] == 1 else ""
-            lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
-            lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
-            lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF{liq_tag}")
-            lines.append(DIVIDER)
-    elif not other_tmrw:
-        lines.append("No signals for tomorrow.")
+    if tomorrow_markets:
+        lines.extend(render_markets(tomorrow_markets))
+    else:
+        lines.append("No markets with sufficient model data for tomorrow.")
         lines.append("")
 
-    # Other Cities: one collapsed line each (gap + direction only)
-    if other_tmrw:
-        lines.append("· Other Cities (Tomorrow)")
-        for g in other_tmrw:
-            gap_sign  = "+" if g["gap"] > 0 else ""
-            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-            lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
-        lines.append("")
-
-    # ── TODAY ACTIVE ──────────────────────────────────────
-    if tier1_today or other_today:
+    # ── TODAY ────────────────────────────────────────────
+    if today_markets:
         lines.append(f"——— TODAY {today_date} ———")
         lines.append("")
+        lines.extend(render_markets(today_markets))
 
-        # Tier 1: full cards
-        for g in tier1_today:
-            gap_sign  = "+" if g["gap"] > 0 else ""
-            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-            liq_tag   = " ⚠️ LOW LIQUIDITY" if g["kalshi_prob"] == 1 else ""
-            lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
-            lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
-            lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF{liq_tag}")
-            lines.append(DIVIDER)
-
-        # Other Cities: collapsed
-        if other_today:
-            lines.append("· Other Cities (Today)")
-            for g in other_today:
-                gap_sign  = "+" if g["gap"] > 0 else ""
-                edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-                lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
-            lines.append("")
-
-    # ── TODAY SETTLED (collapsed — no details needed) ─────
-    if today_settled:
-        lines.append(f"——— TODAY (SETTLED) ———")
-        lines.append("")
-        for g in today_settled:
-            lines.append(f"· {g['city_name']} {g['series_type']} {g['bucket_label']} — {g['kalshi_prob']}%")
-        lines.append("")
-
-    # ── FOOTER ───────────────────────────────────────────
     lines.append("──────────────────────")
-    lines.append("Daily high may exceed highest hourly NWS reading.")
-    lines.append("Near-boundary = extra uncertainty. Not financial advice.")
+    lines.append("Not financial advice.")
 
     return "\n".join(lines)
 
@@ -1263,7 +1305,7 @@ def send_email(message, subject=None):
         log.error(f"Email send failed: {e}")
 
 
-def send_test_email(all_results):
+def send_test_email(all_results, all_forecasts):
     """
     Sends a one-time test email on startup to verify SendGrid is configured
     correctly. Called when SEND_TEST_EMAIL=true is set in env vars.
@@ -1279,7 +1321,7 @@ def send_test_email(all_results):
     if all_results:
         # Reuse the standard formatter so the test email looks exactly like
         # a real one — no separate template to maintain.
-        body = "🧪 TEST — This is a startup verification email.\n\n" + format_alert_message(all_results)
+        body = "🧪 TEST — This is a startup verification email.\n\n" + format_alert_message(all_results, all_forecasts)
     else:
         # No cycle data yet (all cities failed). Still useful to confirm delivery.
         body = (
@@ -1307,30 +1349,34 @@ def log_to_csv(all_results, all_forecasts):
     Never overwrites — always appends (this is our ML training data).
 
     Columns:
-      timestamp          — when this cycle ran (YYYY-MM-DD HH:MM:SS)
-      city               — city display name
-      market_type        — "HIGH" or "LOW"
-      bucket_label       — human-readable bucket, e.g. "48° to 49°" or ">51°F"
-      kalshi_price       — Kalshi market implied probability (0–100)
-      nws_implied        — NWS-derived probability (0–100)
-      gap                — nws_implied - kalshi_price (positive = edge on YES)
-      direction          — "BUY YES" or "BUY NO"
-      confidence         — "HIGH" or "LOW" (based on distance to nearest boundary)
-      was_settled        — True if Kalshi price was >90 or <10 (market nearly over)
-      nws_forecast       — raw NWS grid forecast temp for this market's period (°F)
-      openmeteo_forecast — Open-Meteo ECMWF forecast temp for this period (°F)
-      model_agreement    — True if within 1°F, False if ≥3°F apart, blank if in between
-      ticker             — Kalshi market ticker (used by resolve.py for result lookup)
-      market_date        — "today" or "tomorrow" from the signal's perspective
+      timestamp        — when this cycle ran (YYYY-MM-DD HH:MM:SS)
+      city             — city display name
+      market_type      — "HIGH" or "LOW"
+      bucket_label     — human-readable bucket, e.g. "48° to 49°" or ">51°F"
+      kalshi_price     — Kalshi market implied probability (0–100)
+      nws_implied      — NWS-derived probability (0–100)
+      gap              — nws_implied - kalshi_price (positive = edge on YES)
+      direction        — "BUY YES" or "BUY NO"
+      confidence       — "HIGH" or "LOW" (based on distance to nearest boundary)
+      was_settled      — True if Kalshi price was >90 or <10 (market nearly over)
+      nws_forecast     — raw NWS grid forecast temp for this market's period (°F)
+      ecmwf_high       — Open-Meteo ECMWF IFS 0.4° model forecast temp (°F)
+      gfs_high         — Open-Meteo GFS Seamless model forecast temp (°F)
+      weatherapi_high  — WeatherAPI.com forecast temp for this period (°F)
+      consensus_high   — average of all available model temps (rounded, °F)
+      model_spread     — max − min across all available models (°F); high = stay out
+      ticker           — Kalshi market ticker (used by resolve.py for result lookup)
+      market_date      — "today" or "tomorrow" from the signal's perspective
 
     NOTE: If log.csv already exists with an older schema, delete it and let the
-    bot recreate it with the current 15-column header on the next cycle.
+    bot recreate it with the current 18-column header on the next cycle.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
-        "nws_forecast", "openmeteo_forecast", "model_agreement",
+        "nws_forecast", "ecmwf_high", "gfs_high", "weatherapi_high",
+        "consensus_high", "model_spread",
         "ticker", "market_date",
     ]
 
@@ -1351,41 +1397,47 @@ def log_to_csv(all_results, all_forecasts):
                 city_name = CITIES[city_key]["name"]
 
                 # Pull the raw forecast dicts for this city (safe if missing)
-                forecasts = all_forecasts.get(city_key, {})
-                nws_fc    = forecasts.get("nws")      or {}
-                om_fc     = forecasts.get("openmeteo") or {}
+                forecasts   = all_forecasts.get(city_key, {})
+                nws_fc      = forecasts.get("nws")        or {}
+                ecmwf_fc    = forecasts.get("ecmwf")      or {}
+                gfs_fc      = forecasts.get("gfs")        or {}
+                wapi_fc     = forecasts.get("weatherapi") or {}
 
                 for g in gaps:
-                    # Build the lookup key that matches both forecast dicts:
+                    # Build the lookup key that matches all forecast dicts:
                     # e.g. market_date="today", series_type="HIGH" → "today_high"
                     fc_key = f"{g['market_date']}_{g['series_type'].lower()}"
 
-                    nws_temp = nws_fc.get(fc_key)   # raw NWS grid °F (int or None)
-                    om_temp  = om_fc.get(fc_key)    # Open-Meteo ECMWF °F (int or None)
+                    nws_temp    = nws_fc.get(fc_key)    # NWS grid °F
+                    ecmwf_temp  = ecmwf_fc.get(fc_key)  # ECMWF IFS 0.4° °F
+                    gfs_temp    = gfs_fc.get(fc_key)    # GFS Seamless °F
+                    wapi_temp   = wapi_fc.get(fc_key)   # WeatherAPI.com °F
 
-                    # model_agreement: True ≤1°F apart, False ≥3°F apart, blank in between
-                    if nws_temp is not None and om_temp is not None:
-                        diff      = abs(nws_temp - om_temp)
-                        agreement = True if diff <= 1 else (False if diff >= 3 else "")
-                    else:
-                        agreement = ""   # one or both sources unavailable
+                    # Consensus = average of all available model temps (including NWS)
+                    available = [t for t in [nws_temp, ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+                    consensus = round(sum(available) / len(available)) if available else None
+                    # Spread = range across models; high spread = stay out (low confidence)
+                    spread    = (max(available) - min(available)) if len(available) >= 2 else None
 
                     writer.writerow({
-                        "timestamp":          now,
-                        "city":               city_name,
-                        "market_type":        g["series_type"],
-                        "bucket_label":       g["bucket_label"],
-                        "kalshi_price":       g["kalshi_prob"],
-                        "nws_implied":        g["nws_prob"],
-                        "gap":                g["gap"],
-                        "direction":          g["edge"],
-                        "confidence":         g["confidence"],
-                        "was_settled":        g["was_settled"],
-                        "nws_forecast":       nws_temp if nws_temp is not None else "",
-                        "openmeteo_forecast": om_temp  if om_temp  is not None else "",
-                        "model_agreement":    agreement,
-                        "ticker":             g["ticker"],
-                        "market_date":        g["market_date"],
+                        "timestamp":       now,
+                        "city":            city_name,
+                        "market_type":     g["series_type"],
+                        "bucket_label":    g["bucket_label"],
+                        "kalshi_price":    g["kalshi_prob"],
+                        "nws_implied":     g["nws_prob"],
+                        "gap":             g["gap"],
+                        "direction":       g["edge"],
+                        "confidence":      g["confidence"],
+                        "was_settled":     g["was_settled"],
+                        "nws_forecast":    nws_temp   if nws_temp   is not None else "",
+                        "ecmwf_high":      ecmwf_temp if ecmwf_temp is not None else "",
+                        "gfs_high":        gfs_temp   if gfs_temp   is not None else "",
+                        "weatherapi_high": wapi_temp  if wapi_temp  is not None else "",
+                        "consensus_high":  consensus  if consensus   is not None else "",
+                        "model_spread":    spread     if spread      is not None else "",
+                        "ticker":          g["ticker"],
+                        "market_date":     g["market_date"],
                     })
                     total_rows += 1
 
@@ -1409,16 +1461,31 @@ def _et_now():
 
 
 
-def format_evening_summary(all_results):
+def format_evening_summary(all_results, all_forecasts):
     """
     8 PM evening summary email body.
-    Shows top tomorrow signals (market preview) and today's observed highs.
+    Shows tomorrow's markets (same card format as morning briefing)
+    plus today's observed running highs.
     """
     now           = _et_now()
     today_date    = now.strftime("%b %d")
     tomorrow_date = (now + timedelta(days=1)).strftime("%b %d")
     time_str      = now.strftime("%I:%M %p").lstrip("0")
     DIVIDER       = "————————————————"
+
+    # Tomorrow markets — same filter and sort as morning briefing
+    tomorrow_markets = []
+    for city_key, gaps in all_results.items():
+        city_name = CITIES[city_key]["name"]
+        for g in gaps:
+            if g["market_date"] != "tomorrow":
+                continue
+            md = _get_model_data(city_key, g, all_forecasts)
+            if not md["has_enough_data"]:
+                continue
+            tomorrow_markets.append({**g, "city_name": city_name, "city_key": city_key, **md})
+
+    tomorrow_markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, x["kalshi_prob"]))
 
     lines = [
         f"🌙 Kalshi Evening Summary · {today_date} · {time_str}",
@@ -1427,43 +1494,19 @@ def format_evening_summary(all_results):
         "",
     ]
 
-    # Tomorrow signals — same filter as morning briefing
-    all_tmrw = []
-    for city_key, gaps in all_results.items():
-        for g in gaps:
-            if g["market_date"] == "tomorrow" and not g["was_settled"]:
-                all_tmrw.append({**g, "city_name": CITIES[city_key]["name"], "city_key": city_key})
-
-    all_tmrw.sort(key=lambda x: abs(x["gap"]), reverse=True)
-    shown_tmrw = [g for g in all_tmrw if g["nws_prob"] >= 65]
-
-    tier1_tmrw = [g for g in shown_tmrw if g["city_key"] in TIER1_CITIES]
-    other_tmrw = [g for g in shown_tmrw if g["city_key"] not in TIER1_CITIES]
-
-    # Tier 1: full cards
-    if tier1_tmrw:
-        for g in tier1_tmrw:
-            gap_sign  = "+" if g["gap"] > 0 else ""
-            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
+    if tomorrow_markets:
+        for g in tomorrow_markets:
+            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 3) else ""
             lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
-            lines.append(f"Kalshi {g['kalshi_prob']}% → NWS {g['nws_prob']}% | Gap: {gap_sign}{g['gap']}%")
-            lines.append(f"{edge_icon} {g['edge']} | {g['confidence']} CONF")
+            lines.append(f"Kalshi: {g['kalshi_prob']}%")
+            lines.append(g["models_line"] + spread_tag)
             lines.append(DIVIDER)
-    elif not other_tmrw:
-        lines.append("No significant signals for tomorrow.")
-        lines.append("")
-
-    # Other Cities: collapsed one-liners
-    if other_tmrw:
-        lines.append("· Other Cities")
-        for g in other_tmrw:
-            gap_sign  = "+" if g["gap"] > 0 else ""
-            edge_icon = "✅" if g["edge"] == "BUY YES" else "🔴"
-            lines.append(f"  · {g['city_name']}  {g['series_type']} {g['bucket_label']}  {edge_icon} {gap_sign}{g['gap']}%")
+    else:
+        lines.append("No markets with sufficient model data for tomorrow.")
         lines.append("")
 
     # Today's observed running highs — Tier 1 first, then other cities
-    lines.append(f"——— TODAY'S OBSERVED HIGHS ———")
+    lines.append("——— TODAY'S OBSERVED HIGHS ———")
     lines.append("")
 
     tier1_keys = [k for k in all_results if k in TIER1_CITIES]
@@ -1473,8 +1516,8 @@ def format_evening_summary(all_results):
         for g in all_results[city_key]:
             if g["market_date"] != "today" or g["series_type"] != "HIGH":
                 continue
-            ft  = g.get("forecast_temp")
-            pm  = g.get("probable_max")
+            ft = g.get("forecast_temp")
+            pm = g.get("probable_max")
             if ft is None:
                 continue
             if pm and pm != ft:
@@ -1516,11 +1559,11 @@ def run_cycle():
 
     If a city fails at any step it is skipped; all other cities continue.
     """
-    global _MORNING_SENT_DATE, _EVENING_SENT_DATE
+    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED
 
     cycle_start   = time.time()
     all_results   = {}
-    all_forecasts = {}   # {city_key: {"nws": {...}, "openmeteo": {...}}} for CSV logging
+    all_forecasts = {}   # {city_key: {"nws": {...}, "ecmwf": {...}, "gfs": {...}, "weatherapi": {...}}}
     cities_ok     = 0
     cities_failed = 0
 
@@ -1542,16 +1585,20 @@ def run_cycle():
                 cities_failed += 1
                 continue
 
-            # ── Step 3: Open-Meteo forecast (non-blocking) ───────────────────
-            # Failure here does NOT skip the city — NWS drives signal logic.
-            openmeteo_forecast = fetch_openmeteo_forecast(city_key)
+            # ── Step 3: Multi-model forecasts (non-blocking) ─────────────────
+            # All three can fail without skipping the city — NWS drives signals.
+            ecmwf_forecast      = fetch_ecmwf_forecast(city_key)
+            gfs_forecast        = fetch_gfs_forecast(city_key)
+            weatherapi_forecast = fetch_weatherapi_forecast(city_key)
 
             # ── Step 4: Gap analysis ─────────────────────────────────────────
             gaps = analyze_gaps(city_key, kalshi_markets, nws_forecast)
             all_results[city_key]   = gaps
             all_forecasts[city_key] = {
-                "nws":      nws_forecast,
-                "openmeteo": openmeteo_forecast,
+                "nws":        nws_forecast,
+                "ecmwf":      ecmwf_forecast,
+                "gfs":        gfs_forecast,
+                "weatherapi": weatherapi_forecast,
             }
             cities_ok += 1
 
@@ -1559,15 +1606,32 @@ def run_cycle():
             log.error(f"[{city_key}] Unexpected error — city skipped. ({e})")
             cities_failed += 1
 
-    # ── Email decision ───────────────────────────────────────────────────────
+    # ── Spread tracking + email decision ────────────────────────────────────
     if all_results:
-        et         = _et_now()
-        et_date    = et.date()
-        et_min     = et.hour * 60 + et.minute   # minutes since midnight ET
+        et      = _et_now()
+        et_date = et.date()
+        et_min  = et.hour * 60 + et.minute   # minutes since midnight ET
+
+        # Update _HIGH_SPREAD_FLAGGED and find any markets whose spread just
+        # converged below 1°F (previously had spread ≥ 3°F = "stay out" signal).
+        converged_markets = []
+        for city_key, gaps in all_results.items():
+            for g in gaps:
+                md = _get_model_data(city_key, g, all_forecasts)
+                if not md["has_enough_data"] or md["spread"] is None:
+                    continue
+                ticker = g["ticker"]
+                if md["spread"] >= 3:
+                    _HIGH_SPREAD_FLAGGED.add(ticker)
+                elif md["spread"] < 1 and ticker in _HIGH_SPREAD_FLAGGED and ticker not in _SPREAD_ALERTED:
+                    converged_markets.append({
+                        **g, "city_name": CITIES[city_key]["name"], "city_key": city_key, **md,
+                    })
+                    _SPREAD_ALERTED.add(ticker)
 
         if 420 <= et_min < 435 and _MORNING_SENT_DATE != et_date:
             # ── 7:00–7:14 AM ET: morning briefing ──────────────────────────
-            message = format_alert_message(all_results)
+            message = format_alert_message(all_results, all_forecasts)
             send_email(
                 message,
                 subject=f"☀️ Kalshi Morning Briefing — {et.strftime('%b %d')}",
@@ -1577,7 +1641,7 @@ def run_cycle():
 
         elif 1200 <= et_min < 1215 and _EVENING_SENT_DATE != et_date:
             # ── 8:00–8:14 PM ET: evening summary ───────────────────────────
-            message = format_evening_summary(all_results)
+            message = format_evening_summary(all_results, all_forecasts)
             send_email(
                 message,
                 subject=f"🌙 Kalshi Evening Summary — {et.strftime('%b %d')}",
@@ -1585,11 +1649,33 @@ def run_cycle():
             _EVENING_SENT_DATE = et_date
             log.info("Evening summary sent.")
 
+        elif converged_markets:
+            # ── Intraday: spread convergence alert ──────────────────────────
+            # Fires when a previously high-spread (≥3°F) market's models
+            # converge to <1°F spread — signalling a newly reliable setup.
+            now     = datetime.now()
+            DIVIDER = "————————————————"
+            body_lines = [
+                f"⚡ SPREAD ALERT · {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
+                "",
+                "Model spread has converged on:",
+                "",
+            ]
+            for g in converged_markets:
+                body_lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
+                body_lines.append(f"Kalshi: {g['kalshi_prob']}%")
+                body_lines.append(g["models_line"])
+                body_lines.append(DIVIDER)
+            body_lines.extend(["", "Check Kalshi for these markets.", "Not financial advice."])
+            send_email(
+                "\n".join(body_lines),
+                subject=f"⚡ Spread Convergence Alert — {now.strftime('%b %d')}",
+            )
+            log.info(f"Spread convergence alert sent ({len(converged_markets)} market(s)).")
+
         else:
             # ── Daytime: silent cycle ────────────────────────────────────────
-            # Intraday emails only fire when a running high crosses a bucket
-            # boundary — that's handled by check_running_high_alerts() every 2 min.
-            log.info("Daytime cycle complete — no email (intraday alerts from running-high check).")
+            log.info("Daytime cycle complete — no email this cycle.")
 
         log_to_csv(all_results, all_forecasts)
 
@@ -1615,143 +1701,17 @@ def run_cycle():
     if cities_failed:
         log.warning(f"{cities_failed} city/cities failed this cycle.")
 
-    return all_results
+    return all_results, all_forecasts
 
 
-def check_running_high_alerts():
+def reset_daily_state():
     """
-    Lightweight check that runs every 2 minutes.
-
-    For each city that sets a new running high, looks at every active TODAY
-    HIGH market and checks whether the new temperature newly entered the ±1°F
-    zone around any bucket boundary (floor or cap).
-
-    "Newly entered" means old_max was outside the ±1°F zone and new_max is
-    inside it — so each boundary crossing fires at most once per degree of
-    approach, and generic temp-change noise is suppressed entirely.
-
-    Alert format per market:
-      📍 Houston: 80°F crosses into 79-80°F boundary — Kalshi 22% → NWS 75%
+    Clears spread-tracking state at midnight UTC so each day starts fresh.
+    Called by the scheduler at 00:00 UTC.
     """
-    today_utc  = datetime.utcnow().strftime("%Y-%m-%d")
-    today_date = datetime.now().date()
-    crossings  = []   # formatted alert strings, one per boundary approach
-
-    for city_key in CITIES:
-        try:
-            result = get_current_running_high(city_key)
-            if result is None:
-                continue
-
-            new_max = result["max_observed"]
-            last    = RUNNING_HIGH_LAST.get(city_key, {})
-
-            # First reading of a new UTC day — record silently, no alert
-            if last.get("date_utc") != today_utc:
-                RUNNING_HIGH_LAST[city_key] = {"max_observed": new_max, "date_utc": today_utc}
-                continue
-
-            old_max = last["max_observed"]
-            if new_max <= old_max:
-                continue  # no new high this check
-
-            # Record the new peak before checking markets
-            RUNNING_HIGH_LAST[city_key]["max_observed"] = new_max
-            log.info(f"[{city_key}] New running high: {old_max}°F → {new_max}°F")
-
-            # Check this city's active HIGH markets for today only
-            city_name    = CITIES[city_key]["name"]
-            station_type = CITIES[city_key]["station_type"]
-            markets      = fetch_kalshi_markets(city_key)
-
-            for m in markets:
-                if m["series_type"] != "HIGH":
-                    continue
-
-                # Only today's markets (running high = today's observation)
-                date_part = m["event_ticker"].split("-")[-1]
-                try:
-                    market_date = datetime.strptime(date_part, "%y%b%d").date()
-                except ValueError:
-                    continue
-                if market_date != today_date:
-                    continue
-
-                # Each market has up to two boundaries (floor and/or cap)
-                boundaries = []
-                if m["floor"] is not None:
-                    boundaries.append(m["floor"])
-                if m["cap"] is not None:
-                    boundaries.append(m["cap"])
-
-                for boundary_val in boundaries:
-                    new_near = abs(new_max - boundary_val) <= 1
-                    old_near = abs(old_max - boundary_val) <= 1
-
-                    # Only alert when we newly enter the ±1°F zone around this boundary
-                    if not new_near or old_near:
-                        continue
-
-                    nws_prob    = calculate_nws_probability(
-                        new_max, m["bucket_type"], m["floor"], m["cap"], station_type,
-                    )
-                    kalshi_prob = m["kalshi_prob"]
-                    bucket      = _bucket_label(m)
-
-                    # "crosses" = new_max is on the YES side of the boundary;
-                    # "approaches" = still on the NO side but within 1°F
-                    if m["bucket_type"] == "FLOOR":
-                        on_yes_side = new_max > m["floor"]
-                    elif m["bucket_type"] == "CAP":
-                        on_yes_side = new_max < m["cap"]
-                    else:  # RANGE
-                        on_yes_side = m["floor"] <= new_max <= m["cap"]
-                    action = "crosses into" if on_yes_side else "approaches"
-
-                    crossings.append(
-                        f"📍 {city_name}: {new_max}°F {action} {bucket} boundary"
-                        f" — Kalshi {kalshi_prob}% → NWS {nws_prob}%"
-                    )
-                    log.info(
-                        f"[{city_key}] Boundary {action}: {new_max}°F near {bucket} "
-                        f"(Kalshi {kalshi_prob}%, NWS {nws_prob}%)"
-                    )
-
-        except Exception as e:
-            log.error(f"[{city_key}] Running high check failed: {e}")
-
-    if crossings:
-        now  = datetime.now()
-        body = "\n".join([
-            f"🌡️ RUNNING HIGH ALERT · {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
-            "",
-            *crossings,
-            "",
-            "Check Kalshi for these markets.",
-            "Not financial advice.",
-        ])
-        send_email(
-            body,
-            subject=f"🌡️ Running High Alert — {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
-        )
-        log.info(f"Running high boundary alert sent ({len(crossings)} crossing(s)).")
-    else:
-        log.debug("Running high check: no boundary crossings detected.")
-
-
-def reset_running_high_cache():
-    """
-    Clears RUNNING_HIGH_LAST so the 2-minute check starts fresh each day.
-    Called at midnight UTC by the scheduler.
-
-    This is close enough to midnight LST for all US cities (within 8 hours
-    at most) — the check naturally handles new-day detection per city using
-    the date_utc field anyway, so this is just a memory cleanup.
-    """
-    global RUNNING_HIGH_LAST
-    count = len(RUNNING_HIGH_LAST)
-    RUNNING_HIGH_LAST = {}
-    log.info(f"Running high cache reset at midnight UTC ({count} city entries cleared).")
+    _HIGH_SPREAD_FLAGGED.clear()
+    _SPREAD_ALERTED.clear()
+    log.info("Daily spread-tracking state reset at midnight UTC.")
 
 
 # ============================================================
@@ -1773,13 +1733,12 @@ if __name__ == "__main__":
     log.info("=" * 58)
     log.info("  Kalshi Climate Bot")
     log.info(f"  {len(CITIES)} cities monitored")
-    log.info(f"  Gap-analysis cycle every {RUN_EVERY_MINUTES} min (silent unless triggered)")
+    log.info(f"  Market cycle every {RUN_EVERY_MINUTES} min")
     log.info( "  Email schedule (America/New_York):")
-    log.info( "    ☀️  7:00 AM — morning briefing (full signal list)")
-    log.info( "    ⚡  Intraday — running-high boundary alert (2-min check, boundary ±1°F)")
-    log.info( "    🌙  8:00 PM — evening summary (top signals + today's highs)")
-    log.info( "  Running-high alert check every 2 minutes")
-    log.info( "  Running-high cache reset at midnight UTC")
+    log.info( "    ☀️  7:00 AM — morning briefing (all markets, model cards)")
+    log.info( "    ⚡  Intraday — spread convergence alert (when ≥3° spread drops to <1°)")
+    log.info( "    🌙  8:00 PM — evening summary (tomorrow markets + today's highs)")
+    log.info( "  Daily state reset at midnight UTC")
     if test_mode:
         log.info("  Mode: --test (will exit after first cycle)")
     if SEND_TEST_EMAIL:
@@ -1789,13 +1748,13 @@ if __name__ == "__main__":
     # ── Run one full cycle immediately on startup ────────────────────────────
     # This gives you output right away instead of waiting RUN_EVERY_MINUTES.
     log.info("Running initial cycle on startup...")
-    startup_results = run_cycle()
+    startup_results, startup_forecasts = run_cycle()
 
     # ── Optional test email ──────────────────────────────────────────────────
     # Set SEND_TEST_EMAIL=true in Railway to confirm SendGrid is working.
     # Remove the variable (or set it to false) once you've verified delivery.
     if SEND_TEST_EMAIL:
-        send_test_email(startup_results)
+        send_test_email(startup_results, startup_forecasts)
 
     if test_mode:
         # --test flag: verify the heartbeat printed, then stop cleanly.
@@ -1804,22 +1763,15 @@ if __name__ == "__main__":
 
     # ── Schedule recurring jobs ──────────────────────────────────────────────
 
-    # Main gap-analysis + email cycle every 10 minutes
+    # Main market cycle every 10 minutes (fetches data, checks spread, decides email)
     schedule.every(RUN_EVERY_MINUTES).minutes.do(run_cycle)
 
-    # Lightweight running-high check every 2 minutes.
-    # Only sends an email when a city sets a new daily peak.
-    schedule.every(2).minutes.do(check_running_high_alerts)
-
-    # Reset the running-high cache at midnight UTC each day.
-    # (All US cities are within UTC-5 to UTC-8, so this falls 0–8 hours
-    # after their local midnight — close enough for daily bookkeeping.)
-    schedule.every().day.at("00:00").do(reset_running_high_cache)
+    # Reset spread-tracking state at midnight UTC each day
+    schedule.every().day.at("00:00").do(reset_daily_state)
 
     log.info(
         f"Scheduler active. "
-        f"Full cycle every {RUN_EVERY_MINUTES} min, "
-        f"high check every 2 min. "
+        f"Market cycle every {RUN_EVERY_MINUTES} min. "
         f"Press Ctrl+C to stop."
     )
 
