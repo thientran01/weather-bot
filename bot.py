@@ -34,6 +34,9 @@ ALERT_TO_EMAIL      = os.getenv("ALERT_TO_EMAIL")
 # Minimum gap (%) required to fire a change-alert email mid-day.
 # Override via WETHR_ALERT_THRESHOLD in .env without touching code.
 ALERT_GAP_THRESHOLD = int(os.getenv("WETHR_ALERT_THRESHOLD", "25"))
+# Set SEND_TEST_EMAIL=true in Railway (or .env) to fire one test email on startup.
+# Remove or set to false after confirming SendGrid is working.
+SEND_TEST_EMAIL     = os.getenv("SEND_TEST_EMAIL", "").lower() == "true"
 
 # ============================================================
 # SECTION 2 — CONFIGURATION
@@ -1156,6 +1159,37 @@ def send_email(message, subject=None):
         log.error(f"Email send failed: {e}")
 
 
+def send_test_email(all_results):
+    """
+    Sends a one-time test email on startup to verify SendGrid is configured
+    correctly. Called when SEND_TEST_EMAIL=true is set in env vars.
+
+    The body is identical to a normal full-cycle alert so you can confirm
+    both the SendGrid connection AND the email formatting in one shot.
+    If no city data was collected yet, sends a minimal "bot is alive" note.
+    """
+    log.info("SEND_TEST_EMAIL=true — sending test email now...")
+
+    now = datetime.now()
+
+    if all_results:
+        # Reuse the standard formatter so the test email looks exactly like
+        # a real one — no separate template to maintain.
+        body = "🧪 TEST — This is a startup verification email.\n\n" + format_alert_message(all_results)
+    else:
+        # No cycle data yet (all cities failed). Still useful to confirm delivery.
+        body = (
+            "🧪 TEST — Kalshi bot is alive but no market data was collected.\n"
+            f"Timestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "Check logs for API errors."
+        )
+
+    send_email(
+        body,
+        subject=f"🧪 Kalshi Bot TEST — {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
+    )
+
+
 # ============================================================
 # SECTION 8 — CSV LOGGING
 # Appends every cycle's results to log.csv so you can track
@@ -1528,6 +1562,8 @@ def run_cycle():
     if cities_failed:
         log.warning(f"{cities_failed} city/cities failed this cycle.")
 
+    return all_results
+
 
 def check_running_high_alerts():
     """
@@ -1627,12 +1663,20 @@ if __name__ == "__main__":
     log.info( "  Running-high cache reset at midnight UTC")
     if test_mode:
         log.info("  Mode: --test (will exit after first cycle)")
+    if SEND_TEST_EMAIL:
+        log.info("  SEND_TEST_EMAIL=true — test email will fire after first cycle")
     log.info("=" * 58)
 
     # ── Run one full cycle immediately on startup ────────────────────────────
     # This gives you output right away instead of waiting RUN_EVERY_MINUTES.
     log.info("Running initial cycle on startup...")
-    run_cycle()
+    startup_results = run_cycle()
+
+    # ── Optional test email ──────────────────────────────────────────────────
+    # Set SEND_TEST_EMAIL=true in Railway to confirm SendGrid is working.
+    # Remove the variable (or set it to false) once you've verified delivery.
+    if SEND_TEST_EMAIL:
+        send_test_email(startup_results)
 
     if test_mode:
         # --test flag: verify the heartbeat printed, then stop cleanly.
