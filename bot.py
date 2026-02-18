@@ -780,6 +780,87 @@ def get_current_running_high(city_key):
         return None
 
 
+# ============================================================
+# SECTION 5c — OPEN-METEO FORECAST
+# Second forecast source for cross-validation with NWS.
+# Free, no API key, uses the ECMWF model via daily high/low endpoint.
+# Failure here is non-fatal — NWS still drives all signal logic.
+# ============================================================
+
+def fetch_openmeteo_forecast(city_key):
+    """
+    Fetches today's and tomorrow's high/low temperature forecast from
+    Open-Meteo (https://open-meteo.com). Free, no API key required.
+    Uses the ECMWF model with daily max/min temperatures in Fahrenheit.
+
+    Returns a dict in the same shape as fetch_nws_forecast():
+    {
+        "today_high":    47,   # daily max °F, rounded to nearest int
+        "today_low":     32,
+        "tomorrow_high": 55,
+        "tomorrow_low":  38,
+    }
+
+    Returns None on any failure — never crashes or blocks the main cycle.
+    """
+    city = CITIES[city_key]
+
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude":         city["lat"],
+                "longitude":        city["lon"],
+                "daily":            "temperature_2m_max,temperature_2m_min",
+                "temperature_unit": "fahrenheit",
+                "timezone":         "auto",   # use the city's local timezone
+                "forecast_days":    2,         # today + tomorrow only
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        times = data["daily"]["time"]                 # ["2026-02-18", "2026-02-19"]
+        highs = data["daily"]["temperature_2m_max"]   # [45.2, 52.1]
+        lows  = data["daily"]["temperature_2m_min"]   # [32.5, 38.7]
+
+        today    = datetime.now().strftime("%Y-%m-%d")
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        result = {
+            "today_high":    None,
+            "today_low":     None,
+            "tomorrow_high": None,
+            "tomorrow_low":  None,
+        }
+
+        for i, date_str in enumerate(times):
+            # Round to the nearest whole degree for apples-to-apples comparison with NWS
+            high = round(highs[i]) if highs[i] is not None else None
+            low  = round(lows[i])  if lows[i]  is not None else None
+            if date_str == today:
+                result["today_high"] = high
+                result["today_low"]  = low
+            elif date_str == tomorrow:
+                result["tomorrow_high"] = high
+                result["tomorrow_low"]  = low
+
+        log.info(
+            f"[{city_key}] Open-Meteo: "
+            f"today {result['today_high']}°F/{result['today_low']}°F, "
+            f"tomorrow {result['tomorrow_high']}°F/{result['tomorrow_low']}°F"
+        )
+        return result
+
+    except requests.exceptions.RequestException as e:
+        log.error(f"[{city_key}] Open-Meteo request failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"[{city_key}] Unexpected error in Open-Meteo fetch: {e}")
+        return None
+
+
 def calculate_nws_probability(forecast_temp, bucket_type, floor, cap, station_type):
     """
     Estimates the probability that a Kalshi market resolves YES, given the
@@ -1189,31 +1270,38 @@ def send_test_email(all_results):
 # how markets and forecasts have changed over time.
 # ============================================================
 
-def log_to_csv(all_results):
+def log_to_csv(all_results, all_forecasts):
     """
     Appends one row per market per cycle to log.csv.
     Creates the file with a header row if it doesn't exist yet.
     Never overwrites — always appends (this is our ML training data).
 
     Columns:
-      timestamp    — when this cycle ran (YYYY-MM-DD HH:MM:SS)
-      city         — city display name
-      market_type  — "HIGH" or "LOW"
-      bucket_label — human-readable bucket, e.g. "48° to 49°" or ">51°F"
-      kalshi_price — Kalshi market implied probability (0–100)
-      nws_implied  — NWS-derived probability (0–100)
-      gap          — nws_implied - kalshi_price (positive = edge on YES)
-      direction    — "BUY YES" or "BUY NO"
-      confidence   — "HIGH" or "LOW" (based on distance to nearest boundary)
-      was_settled  — True if Kalshi price was >90 or <10 (market nearly over)
+      timestamp          — when this cycle ran (YYYY-MM-DD HH:MM:SS)
+      city               — city display name
+      market_type        — "HIGH" or "LOW"
+      bucket_label       — human-readable bucket, e.g. "48° to 49°" or ">51°F"
+      kalshi_price       — Kalshi market implied probability (0–100)
+      nws_implied        — NWS-derived probability (0–100)
+      gap                — nws_implied - kalshi_price (positive = edge on YES)
+      direction          — "BUY YES" or "BUY NO"
+      confidence         — "HIGH" or "LOW" (based on distance to nearest boundary)
+      was_settled        — True if Kalshi price was >90 or <10 (market nearly over)
+      nws_forecast       — raw NWS grid forecast temp for this market's period (°F)
+      openmeteo_forecast — Open-Meteo ECMWF forecast temp for this period (°F)
+      model_agreement    — True if within 1°F, False if ≥3°F apart, blank if in between
+
+    NOTE: If log.csv already exists with the old schema (10 columns), delete it and
+    let the bot recreate it with the new 13-column header on the next cycle.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
+        "nws_forecast", "openmeteo_forecast", "model_agreement",
     ]
 
-    now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_exists = os.path.isfile(LOG_FILE)
     total_rows  = 0
 
@@ -1228,18 +1316,41 @@ def log_to_csv(all_results):
 
             for city_key, gaps in all_results.items():
                 city_name = CITIES[city_key]["name"]
+
+                # Pull the raw forecast dicts for this city (safe if missing)
+                forecasts = all_forecasts.get(city_key, {})
+                nws_fc    = forecasts.get("nws")      or {}
+                om_fc     = forecasts.get("openmeteo") or {}
+
                 for g in gaps:
+                    # Build the lookup key that matches both forecast dicts:
+                    # e.g. market_date="today", series_type="HIGH" → "today_high"
+                    fc_key = f"{g['market_date']}_{g['series_type'].lower()}"
+
+                    nws_temp = nws_fc.get(fc_key)   # raw NWS grid °F (int or None)
+                    om_temp  = om_fc.get(fc_key)    # Open-Meteo ECMWF °F (int or None)
+
+                    # model_agreement: True ≤1°F apart, False ≥3°F apart, blank in between
+                    if nws_temp is not None and om_temp is not None:
+                        diff      = abs(nws_temp - om_temp)
+                        agreement = True if diff <= 1 else (False if diff >= 3 else "")
+                    else:
+                        agreement = ""   # one or both sources unavailable
+
                     writer.writerow({
-                        "timestamp":    now,
-                        "city":         city_name,
-                        "market_type":  g["series_type"],
-                        "bucket_label": g["bucket_label"],
-                        "kalshi_price": g["kalshi_prob"],
-                        "nws_implied":  g["nws_prob"],
-                        "gap":          g["gap"],
-                        "direction":    g["edge"],
-                        "confidence":   g["confidence"],
-                        "was_settled":  g["was_settled"],
+                        "timestamp":          now,
+                        "city":               city_name,
+                        "market_type":        g["series_type"],
+                        "bucket_label":       g["bucket_label"],
+                        "kalshi_price":       g["kalshi_prob"],
+                        "nws_implied":        g["nws_prob"],
+                        "gap":                g["gap"],
+                        "direction":          g["edge"],
+                        "confidence":         g["confidence"],
+                        "was_settled":        g["was_settled"],
+                        "nws_forecast":       nws_temp if nws_temp is not None else "",
+                        "openmeteo_forecast": om_temp  if om_temp  is not None else "",
+                        "model_agreement":    agreement,
                     })
                     total_rows += 1
 
@@ -1359,6 +1470,7 @@ def run_cycle():
 
     cycle_start   = time.time()
     all_results   = {}
+    all_forecasts = {}   # {city_key: {"nws": {...}, "openmeteo": {...}}} for CSV logging
     cities_ok     = 0
     cities_failed = 0
 
@@ -1380,9 +1492,17 @@ def run_cycle():
                 cities_failed += 1
                 continue
 
-            # ── Step 3: Gap analysis ─────────────────────────────────────────
+            # ── Step 3: Open-Meteo forecast (non-blocking) ───────────────────
+            # Failure here does NOT skip the city — NWS drives signal logic.
+            openmeteo_forecast = fetch_openmeteo_forecast(city_key)
+
+            # ── Step 4: Gap analysis ─────────────────────────────────────────
             gaps = analyze_gaps(city_key, kalshi_markets, nws_forecast)
-            all_results[city_key] = gaps
+            all_results[city_key]   = gaps
+            all_forecasts[city_key] = {
+                "nws":      nws_forecast,
+                "openmeteo": openmeteo_forecast,
+            }
             cities_ok += 1
 
         except Exception as e:
@@ -1421,7 +1541,7 @@ def run_cycle():
             # boundary — that's handled by check_running_high_alerts() every 2 min.
             log.info("Daytime cycle complete — no email (intraday alerts from running-high check).")
 
-        log_to_csv(all_results)
+        log_to_csv(all_results, all_forecasts)
 
     else:
         log.warning("No city data collected this cycle — email and CSV skipped.")
