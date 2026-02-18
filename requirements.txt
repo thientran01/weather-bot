@@ -6,3 +6,4 @@ python-dotenv==1.0.0    # Local dev only: loads credentials from .env file.
                         # On Railway, env vars are injected directly — load_dotenv()
                         # is a no-op when .env is absent, so this is safe to keep.
 schedule==1.2.1         # Repeating timer (run_cycle every 10 min, etc.)
+scipy>=1.11.0           # Normal distribution CDF for Gaussian probability model

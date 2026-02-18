@@ -18,6 +18,7 @@ import schedule
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from scipy.stats import norm
 import requests
 
 # ============================================================
@@ -967,74 +968,38 @@ def _get_model_data(city_key, g, all_forecasts):
     }
 
 
-def calculate_nws_probability(forecast_temp, bucket_type, floor, cap, station_type):
+def calculate_gaussian_probability(forecast_temp, bucket_type, floor, cap, std_dev=2.5):
     """
-    Estimates the probability that a Kalshi market resolves YES, given the
-    NWS forecast temperature for that day.
+    Estimates the probability that a Kalshi market resolves YES using a Normal
+    distribution CDF centered on the forecast temperature.
+
+    Weather forecast error follows roughly a bell curve, not a step function.
+    Using the CDF gives a smooth, continuous probability that naturally drops
+    as you move away from a boundary — no arbitrary 55%/65%/35% cutoffs.
+
+    std_dev controls the width of the uncertainty bell:
+      2.0 — models agree tightly (spread < 1°F): narrow curve, high confidence
+      2.5 — baseline for 1-day-out forecasts
+      4.0 — models diverge (spread > 3°F): wide curve, lower confidence
 
     Works for all three bucket types:
+      FLOOR  (">floor"):       P(actual > floor)
+      CAP    ("<cap"):         P(actual < cap)
+      RANGE  ("floor–cap"):   P(floor ≤ actual ≤ cap)
 
-      FLOOR  (">floor"): YES if actual > floor
-      CAP    ("<cap"):   YES if actual < cap
-      RANGE  ("floor–cap"): YES if floor <= actual <= cap
-
-    Probability model (same for all types, based on distance to nearest boundary):
-
-      dist to nearest boundary <= 1°    → 55%  (boundary zone, high uncertainty)
-      dist > 1°, forecast on YES side   → 80% (hourly) or 65% (5-min)
-      dist > 1°, forecast on NO side, dist <= 2° → 35%
-      dist > 2°, forecast on NO side    → 10%
-
-    For RANGE markets, "nearest boundary" is whichever edge of the range the
-    forecast is closest to (whether inside or outside the range).
-
-    Returns an integer 0–100.
+    Returns a float 0.0–100.0 (caller should round for display/logging).
     """
+    dist = norm(loc=forecast_temp, scale=std_dev)
+
     if bucket_type == "FLOOR":
-        # YES condition: actual temp > floor
-        dist        = abs(forecast_temp - floor)
-        on_yes_side = forecast_temp > floor
-
+        return (1 - dist.cdf(floor)) * 100
     elif bucket_type == "CAP":
-        # YES condition: actual temp < cap
-        dist        = abs(forecast_temp - cap)
-        on_yes_side = forecast_temp < cap
-
+        return dist.cdf(cap) * 100
     elif bucket_type == "RANGE":
-        # YES condition: floor <= actual temp <= cap
-        inside = (floor <= forecast_temp <= cap)
-
-        if inside:
-            # Distance to whichever edge of the range the forecast is nearest to
-            dist        = min(forecast_temp - floor, cap - forecast_temp)
-            on_yes_side = True
-        else:
-            # Forecast is outside the range — find distance to the nearer boundary
-            if forecast_temp < floor:
-                dist = floor - forecast_temp   # how far below the floor we are
-            else:
-                dist = forecast_temp - cap     # how far above the cap we are
-            on_yes_side = False
-
+        return (dist.cdf(cap) - dist.cdf(floor)) * 100
     else:
-        log.warning(f"calculate_nws_probability: unknown bucket_type '{bucket_type}'")
-        return 50  # neutral fallback
-
-    # Apply the step-function probability model.
-    # Strict < 1 (not <= 1) so that a forecast exactly 1°F outside a boundary
-    # correctly returns 35% (lean NO) rather than 55% (boundary zone).
-    # dist = 0 still hits this branch and returns 55% (literally on the edge).
-    if dist < 1:
-        return 55   # right at a boundary — too close to call
-
-    if on_yes_side:
-        # Forecast is clearly on the YES side (>1° past threshold or inside range)
-        return 80 if station_type == "hourly" else 65
-
-    if dist <= 2:
-        return 35   # forecast is on the NO side but only 1–2° away
-
-    return 10       # forecast is clearly on the NO side
+        log.warning(f"calculate_gaussian_probability: unknown bucket_type '{bucket_type}'")
+        return 50.0
 
 
 def _bucket_label(market):
@@ -1062,22 +1027,30 @@ def _bucket_label(market):
 # The "gap" is the difference — a big gap = potentially interesting trade.
 # ============================================================
 
-def analyze_gaps(city_key, kalshi_markets, nws_forecast):
+def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
     """
-    For each Kalshi market, compares the NWS-implied probability against
-    the Kalshi market price and calculates the gap.
+    For each Kalshi market, compares the Gaussian model-implied probability
+    against the Kalshi market price and calculates the gap.
 
     Handles FLOOR, CAP, and RANGE bucket types dynamically — never assumes
     a fixed bucket shape. Works correctly even if Kalshi changes all buckets
     between runs.
 
-    A positive gap means NWS thinks YES is MORE likely than Kalshi does → edge on YES.
-    A negative gap means NWS thinks NO is more likely → edge on NO.
+    city_forecasts: optional dict {"nws": {...}, "ecmwf": {...}, "gfs": {...},
+                    "weatherapi": {...}} — used to compute dynamic std_dev from
+                    model spread. If omitted, std_dev=2.5 (baseline) is used.
+
+    Dynamic std_dev logic per market period:
+      spread < 1°F  → std_dev = 2.0  (models agree — higher confidence)
+      spread > 3°F  → std_dev = 4.0  (models disagree — lower confidence)
+      otherwise     → std_dev = 2.5  (baseline for 1-day-out forecasts)
+
+    A positive gap means the model thinks YES is MORE likely than Kalshi does.
+    A negative gap means the model thinks NO is more likely.
 
     Returns a list sorted by absolute gap size (largest gaps first).
     """
-    city         = CITIES[city_key]
-    station_type = city["station_type"]
+    city = CITIES[city_key]
 
     today    = datetime.now().date()
     tomorrow = today + timedelta(days=1)
@@ -1134,28 +1107,48 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast):
             # No temperature available for this period yet — skip
             continue
 
-        # --- Step 3: Calculate NWS-implied probability for this bucket ---
-        nws_prob = calculate_nws_probability(
+        # --- Step 3: Determine dynamic std_dev from model spread ---
+        # Pull all available model temps for this market's date+series period
+        # and measure how much they disagree. High spread → wider uncertainty.
+        std_dev = 2.5   # baseline for 1-day-out forecasts
+        if city_forecasts:
+            fc_key = f"{date_label}_{market['series_type'].lower()}"
+            model_temps = [
+                (city_forecasts.get("nws")        or {}).get(fc_key),
+                (city_forecasts.get("ecmwf")      or {}).get(fc_key),
+                (city_forecasts.get("gfs")        or {}).get(fc_key),
+                (city_forecasts.get("weatherapi") or {}).get(fc_key),
+            ]
+            valid_temps = [t for t in model_temps if t is not None]
+            if len(valid_temps) >= 2:
+                spread = max(valid_temps) - min(valid_temps)
+                if spread < 1:
+                    std_dev = 2.0   # models tightly agree — narrow curve, high confidence
+                elif spread > 3:
+                    std_dev = 4.0   # models diverge — wide curve, low confidence
+
+        # --- Step 4: Calculate Gaussian-implied probability for this bucket ---
+        nws_prob_raw = calculate_gaussian_probability(
             forecast_temp,
             market["bucket_type"],
             market["floor"],
             market["cap"],
-            station_type,
+            std_dev,
         )
+        nws_prob = round(nws_prob_raw)   # integer for gap math and display
 
-        # --- Step 4: Compute the gap ---
+        # --- Step 5: Compute the gap ---
         gap  = nws_prob - market["kalshi_prob"]
         edge = "BUY YES" if gap > 0 else "BUY NO"
 
         if abs(gap) < MIN_GAP_TO_SHOW:
             continue
 
-        # Confidence: HIGH when forecast is clearly away from a boundary (nws_prob 65/80/10).
-        # LOW when forecast is in the boundary zone (nws_prob 55) or only 1-2° past it (35).
-        confidence = "LOW" if nws_prob in (55, 35) else "HIGH"
+        # Confidence: HIGH when the model is clearly on one side (≥65% YES or ≤35% YES).
+        # LOW when it's in the 35–65% zone — too close to the boundary to trust.
+        confidence = "HIGH" if nws_prob >= 65 or nws_prob <= 35 else "LOW"
 
         # was_settled: Kalshi has already priced this very strongly — market is nearly over.
-        # These go into the SETTLED section of the email rather than ACTIONABLE.
         was_settled = market["kalshi_prob"] > 90 or market["kalshi_prob"] < 10
 
         results.append({
@@ -1174,6 +1167,7 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast):
             "edge":          edge,
             "confidence":    confidence,
             "was_settled":   was_settled,
+            "std_dev_used":  std_dev,
         })
 
     results.sort(key=lambda x: abs(x["gap"]), reverse=True)
@@ -1365,18 +1359,19 @@ def log_to_csv(all_results, all_forecasts):
       weatherapi_high  — WeatherAPI.com forecast temp for this period (°F)
       consensus_high   — average of all available model temps (rounded, °F)
       model_spread     — max − min across all available models (°F); high = stay out
+      std_dev_used     — Gaussian std_dev used for nws_implied (2.0/2.5/4.0 based on spread)
       ticker           — Kalshi market ticker (used by resolve.py for result lookup)
       market_date      — "today" or "tomorrow" from the signal's perspective
 
     NOTE: If log.csv already exists with an older schema, delete it and let the
-    bot recreate it with the current 18-column header on the next cycle.
+    bot recreate it with the current 19-column header on the next cycle.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
         "nws_forecast", "ecmwf_high", "gfs_high", "weatherapi_high",
-        "consensus_high", "model_spread",
+        "consensus_high", "model_spread", "std_dev_used",
         "ticker", "market_date",
     ]
 
@@ -1436,6 +1431,7 @@ def log_to_csv(all_results, all_forecasts):
                         "weatherapi_high": wapi_temp  if wapi_temp  is not None else "",
                         "consensus_high":  consensus  if consensus   is not None else "",
                         "model_spread":    spread     if spread      is not None else "",
+                        "std_dev_used":    g.get("std_dev_used", ""),
                         "ticker":          g["ticker"],
                         "market_date":     g["market_date"],
                     })
@@ -1591,15 +1587,18 @@ def run_cycle():
             gfs_forecast        = fetch_gfs_forecast(city_key)
             weatherapi_forecast = fetch_weatherapi_forecast(city_key)
 
-            # ── Step 4: Gap analysis ─────────────────────────────────────────
-            gaps = analyze_gaps(city_key, kalshi_markets, nws_forecast)
-            all_results[city_key]   = gaps
-            all_forecasts[city_key] = {
+            # Bundle forecasts so analyze_gaps() can compute dynamic std_dev
+            city_forecasts = {
                 "nws":        nws_forecast,
                 "ecmwf":      ecmwf_forecast,
                 "gfs":        gfs_forecast,
                 "weatherapi": weatherapi_forecast,
             }
+
+            # ── Step 4: Gap analysis ─────────────────────────────────────────
+            gaps = analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts)
+            all_results[city_key]   = gaps
+            all_forecasts[city_key] = city_forecasts   # reuse — no redundant copy
             cities_ok += 1
 
         except Exception as e:
