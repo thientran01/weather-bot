@@ -1251,13 +1251,20 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
         # probable_min_temp mirrors probable_max_temp for LOW markets:
         # set only when running low observations are available, None otherwise.
         probable_min_temp = None
+        # observed_running: the actual running observed value when live observations
+        # replace the NWS grid forecast. None for tomorrow markets or when no
+        # observations exist yet. Stored so log_to_csv() can write it separately
+        # from the grid forecast — keeping both for unambiguous historical analysis.
+        observed_running  = None
 
         if date_label == "today" and market["series_type"] == "HIGH":
+            nws_grid_forecast = nws_forecast.get("today_high")   # raw grid, always
             running = nws_forecast.get("today_running_high")
             if running is not None:
                 # Use the conservative observed max (floor(C×9/5+32)).
                 # probable_max is stored in the result for display purposes.
                 forecast_temp     = running["max_observed"]
+                observed_running  = running["max_observed"]
                 probable_max_temp = running["probable_max"]
             else:
                 # Fall back to the grid forecast if observations aren't available
@@ -1265,20 +1272,24 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
                 forecast_temp     = nws_forecast["today_high"]
                 probable_max_temp = None
         elif date_label == "today" and market["series_type"] == "LOW":
+            nws_grid_forecast = nws_forecast.get("today_low")    # raw grid, always
             running = nws_forecast.get("today_running_low")
             if running is not None:
                 # Use the conservative observed min (floor(C×9/5+32)).
                 # probable_min is stored in the result for display purposes.
                 forecast_temp     = running["min_observed"]
+                observed_running  = running["min_observed"]
                 probable_min_temp = running["probable_min"]
             else:
                 # Fall back to the grid forecast if observations aren't available.
                 forecast_temp     = nws_forecast["today_low"]
             probable_max_temp = None
         elif date_label == "tomorrow" and market["series_type"] == "HIGH":
+            nws_grid_forecast = nws_forecast.get("tomorrow_high")
             forecast_temp     = nws_forecast["tomorrow_high"]
             probable_max_temp = None
         else:
+            nws_grid_forecast = nws_forecast.get("tomorrow_low")
             forecast_temp     = nws_forecast["tomorrow_low"]
             probable_max_temp = None
 
@@ -1346,8 +1357,10 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             "gap":           gap,
             "edge":          edge,
             "confidence":    confidence,
-            "was_settled":   was_settled,
-            "std_dev_used":  std_dev,
+            "was_settled":      was_settled,
+            "std_dev_used":     std_dev,
+            "nws_grid_forecast": nws_grid_forecast,  # raw NWS grid temp (never observed)
+            "observed_running":  observed_running,    # live obs if used, else None
         })
 
     results.sort(key=lambda x: abs(x["gap"]), reverse=True)
@@ -1578,35 +1591,45 @@ def log_to_csv(all_results, all_forecasts):
     Creates the file with a header row if it doesn't exist yet.
     Never overwrites — always appends (this is our ML training data).
 
-    Columns:
-      timestamp        — when this cycle ran (YYYY-MM-DD HH:MM:SS)
-      city             — city display name
-      market_type      — "HIGH" or "LOW"
-      bucket_label     — human-readable bucket, e.g. "48° to 49°" or ">51°F"
-      kalshi_price     — Kalshi market implied probability (0–100)
-      nws_implied      — NWS-derived probability (0–100)
-      gap              — nws_implied - kalshi_price (positive = edge on YES)
-      direction        — "BUY YES" or "BUY NO"
-      confidence       — "HIGH" or "LOW" (based on distance to nearest boundary)
-      was_settled      — True if Kalshi price was >90 or <10 (market nearly over)
-      nws_forecast     — raw NWS grid forecast temp for this market's period (°F)
-      ecmwf_high       — Open-Meteo ECMWF IFS 0.4° model forecast temp (°F)
-      gfs_high         — Open-Meteo GFS Seamless model forecast temp (°F)
-      weatherapi_high  — WeatherAPI.com forecast temp for this period (°F)
-      consensus_high   — average of all available model temps (rounded, °F)
-      model_spread     — max − min across all available models (°F); high = stay out
-      std_dev_used     — Gaussian std_dev used for nws_implied (2.0/2.5/4.0 based on spread)
-      ticker           — Kalshi market ticker (used by resolve.py for result lookup)
-      market_date      — "today" or "tomorrow" from the signal's perspective
+    Columns (21 total):
+      timestamp           — when this cycle ran (YYYY-MM-DD HH:MM:SS)
+      city                — city display name
+      market_type         — "HIGH" or "LOW"
+      bucket_label        — human-readable bucket, e.g. "48° to 49°" or ">51°F"
+      kalshi_price        — Kalshi market implied probability (0–100)
+      nws_implied         — NWS-derived probability (0–100)
+      gap                 — nws_implied - kalshi_price (positive = edge on YES)
+      direction           — "BUY YES" or "BUY NO"
+      confidence          — "HIGH" or "LOW" (based on distance to nearest boundary)
+      was_settled         — True if Kalshi price was >90 or <10 (market nearly over)
+      nws_grid_forecast   — raw NWS grid forecast temp for this period (°F).
+                            NEVER the observed running value — always the grid number.
+      observed_running    — live observed running high or low (°F) if observations
+                            were available for a "today" market; empty for tomorrow
+                            markets or when no obs exist yet (too early in the day).
+      forecast_temp_used  — the actual temperature that drove the probability calc.
+                            For today markets with observations this equals
+                            observed_running; otherwise equals nws_grid_forecast.
+      ecmwf_high          — Open-Meteo ECMWF IFS 0.4° model forecast temp (°F)
+      gfs_high            — Open-Meteo GFS Seamless model forecast temp (°F)
+      weatherapi_high     — WeatherAPI.com forecast temp for this period (°F)
+      consensus_high      — average of all available model temps (rounded, °F)
+      model_spread        — max − min across all available models (°F); high = stay out
+      std_dev_used        — Gaussian std_dev used for nws_implied (2.0/2.5/4.0)
+      ticker              — Kalshi market ticker (used by resolve.py for result lookup)
+      market_date         — "today" or "tomorrow" from the signal's perspective
 
-    NOTE: If log.csv already exists with an older schema, delete it and let the
-    bot recreate it with the current 19-column header on the next cycle.
+    SCHEMA CHANGE (replaces old single "nws_forecast" column with three columns):
+      nws_grid_forecast / observed_running / forecast_temp_used
+    If log.csv exists with the OLD schema (has "nws_forecast" header), delete it
+    and restart — the bot will recreate it with the new 21-column header.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
-        "nws_forecast", "ecmwf_high", "gfs_high", "weatherapi_high",
+        "nws_grid_forecast", "observed_running", "forecast_temp_used",
+        "ecmwf_high", "gfs_high", "weatherapi_high",
         "consensus_high", "model_spread", "std_dev_used",
         "ticker", "market_date",
     ]
@@ -1614,6 +1637,23 @@ def log_to_csv(all_results, all_forecasts):
     now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_exists = os.path.isfile(LOG_FILE)
     total_rows  = 0
+
+    # Detect stale schema: if the existing file still has the old "nws_forecast"
+    # column (and not the new "nws_grid_forecast"), warn the user to delete it.
+    if file_exists:
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as _check:
+                first_line = _check.readline()
+            if "nws_forecast" in first_line and "nws_grid_forecast" not in first_line:
+                log.warning(
+                    f"⚠️  SCHEMA CHANGE DETECTED in {LOG_FILE}: "
+                    "the file uses the old 'nws_forecast' column. "
+                    "Delete log.csv and restart the bot — it will recreate the file "
+                    "with the new 21-column schema "
+                    "(nws_grid_forecast / observed_running / forecast_temp_used)."
+                )
+        except Exception:
+            pass  # non-fatal; proceed normally
 
     try:
         with open(LOG_FILE, "a", newline="") as f:
@@ -1650,26 +1690,35 @@ def log_to_csv(all_results, all_forecasts):
                     # Spread = range across models; high spread = stay out (low confidence)
                     spread    = (max(available) - min(available)) if len(available) >= 2 else None
 
+                    # nws_grid_forecast and observed_running come from analyze_gaps()
+                    # result dict directly — they were captured there where the
+                    # branching logic already knows exactly which value is which.
+                    grid_fc   = g.get("nws_grid_forecast")   # raw NWS grid temp
+                    obs_run   = g.get("observed_running")     # live obs (or None)
+                    fc_used   = g.get("forecast_temp")        # what drove the signal
+
                     writer.writerow({
-                        "timestamp":       now,
-                        "city":            city_name,
-                        "market_type":     g["series_type"],
-                        "bucket_label":    g["bucket_label"],
-                        "kalshi_price":    g["kalshi_prob"],
-                        "nws_implied":     g["nws_prob"],
-                        "gap":             g["gap"],
-                        "direction":       g["edge"],
-                        "confidence":      g["confidence"],
-                        "was_settled":     g["was_settled"],
-                        "nws_forecast":    nws_temp   if nws_temp   is not None else "",
-                        "ecmwf_high":      ecmwf_temp if ecmwf_temp is not None else "",
-                        "gfs_high":        gfs_temp   if gfs_temp   is not None else "",
-                        "weatherapi_high": wapi_temp  if wapi_temp  is not None else "",
-                        "consensus_high":  consensus  if consensus   is not None else "",
-                        "model_spread":    spread     if spread      is not None else "",
-                        "std_dev_used":    g.get("std_dev_used", ""),
-                        "ticker":          g["ticker"],
-                        "market_date":     g["market_date"],
+                        "timestamp":          now,
+                        "city":               city_name,
+                        "market_type":        g["series_type"],
+                        "bucket_label":       g["bucket_label"],
+                        "kalshi_price":       g["kalshi_prob"],
+                        "nws_implied":        g["nws_prob"],
+                        "gap":                g["gap"],
+                        "direction":          g["edge"],
+                        "confidence":         g["confidence"],
+                        "was_settled":        g["was_settled"],
+                        "nws_grid_forecast":  grid_fc   if grid_fc  is not None else "",
+                        "observed_running":   obs_run   if obs_run  is not None else "",
+                        "forecast_temp_used": fc_used   if fc_used  is not None else "",
+                        "ecmwf_high":         ecmwf_temp if ecmwf_temp is not None else "",
+                        "gfs_high":           gfs_temp   if gfs_temp   is not None else "",
+                        "weatherapi_high":    wapi_temp  if wapi_temp  is not None else "",
+                        "consensus_high":     consensus  if consensus  is not None else "",
+                        "model_spread":       spread     if spread     is not None else "",
+                        "std_dev_used":       g.get("std_dev_used", ""),
+                        "ticker":             g["ticker"],
+                        "market_date":        g["market_date"],
                     })
                     total_rows += 1
 
