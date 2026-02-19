@@ -1042,6 +1042,98 @@ def fetch_gfs_forecast(city_key):
     return _fetch_openmeteo_model(city_key, "gfs_seamless")
 
 
+def fetch_gem_forecast(city_key):
+    """Fetches the Canadian GEM Seamless model forecast from Open-Meteo. Free, no key needed."""
+    return _fetch_openmeteo_model(city_key, "gem_seamless")
+
+
+def fetch_icon_forecast(city_key):
+    """Fetches the DWD ICON Seamless model forecast from Open-Meteo. Free, no key needed."""
+    return _fetch_openmeteo_model(city_key, "icon_seamless")
+
+
+def fetch_hourly_forecast(city_key):
+    """
+    Fetches hourly temperature forecasts from Open-Meteo (GFS model) for the next 48 hours.
+    Returns a dict of {iso_datetime_string: temp_f} for each hour, or None on failure.
+
+    Used to estimate remaining high/low potential for today's markets:
+    - For today's HIGH: what's the max forecasted temp for remaining hours today?
+    - For today's LOW: what's the min forecasted temp for remaining hours today?
+    """
+    city = CITIES[city_key]
+
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude":         city["lat"],
+                "longitude":        city["lon"],
+                "hourly":           "temperature_2m",
+                "temperature_unit": "fahrenheit",
+                "timezone":         "auto",
+                "forecast_days":    2,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        times = data["hourly"]["time"]             # ["2026-02-19T00:00", "2026-02-19T01:00", ...]
+        temps = data["hourly"]["temperature_2m"]   # [52.3, 51.1, ...] in °F
+
+        result = {}
+        for t, temp in zip(times, temps):
+            if temp is not None:
+                result[t] = round(temp)
+
+        log.info(f"[{city_key}] Hourly forecast: {len(result)} hours fetched")
+        return result
+
+    except requests.exceptions.RequestException as e:
+        log.error(f"[{city_key}] Hourly forecast request failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"[{city_key}] Unexpected error in hourly forecast fetch: {e}")
+        return None
+
+
+def estimate_remaining_extreme(hourly_data, city_key, extreme_type):
+    """
+    Given hourly forecast data, estimates the max or min temperature
+    for the remaining hours of today (in LST).
+
+    extreme_type: "high" or "low"
+
+    Returns the forecasted remaining extreme temp (int °F) or None.
+    Uses the city's lst_utc_offset to determine which hours belong to "today".
+
+    NOTE: Open-Meteo timezone="auto" returns times in the station's local civil
+    time, which includes DST in summer. Our lst_utc_offset is fixed (no DST).
+    In February this is fine (no DST active). Starting in March when clocks
+    change, Open-Meteo times will run 1 hour ahead of LST — a future improvement
+    would apply a DST correction for affected months.
+    """
+    lst_offset = CITIES[city_key]["lst_utc_offset"]
+    now_lst    = datetime.utcnow() + timedelta(hours=lst_offset)
+    today_lst  = now_lst.date()
+
+    future_temps = []
+    for time_str, temp_f in hourly_data.items():
+        try:
+            dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        # Only include hours that are both on today's LST date AND in the future
+        if dt.date() == today_lst and dt.hour > now_lst.hour:
+            future_temps.append(temp_f)
+
+    if not future_temps:
+        return None
+
+    return max(future_temps) if extreme_type == "high" else min(future_temps)
+
+
 def fetch_weatherapi_forecast(city_key):
     """
     Fetches today's and tomorrow's high/low temperature forecast from WeatherAPI.com.
@@ -1099,7 +1191,7 @@ def _get_model_data(city_key, g, all_forecasts):
     Pulls forecast temperatures from all models for a single market gap result.
 
     Returns a dict with:
-      nws_temp / ecmwf_temp / gfs_temp / wapi_temp — °F ints or None
+      nws_temp / ecmwf_temp / gfs_temp / gem_temp / icon_temp / wapi_temp — °F ints or None
       spread          — max−min across all available models (°F int or None)
       models_line     — pre-formatted "Models: NWS 79° | ECMWF 78° | ..." string
       has_enough_data — True only if NWS and at least one other model are present
@@ -1110,10 +1202,12 @@ def _get_model_data(city_key, g, all_forecasts):
     nws_temp   = (forecasts.get("nws")        or {}).get(fc_key)
     ecmwf_temp = (forecasts.get("ecmwf")      or {}).get(fc_key)
     gfs_temp   = (forecasts.get("gfs")        or {}).get(fc_key)
+    gem_temp   = (forecasts.get("gem")        or {}).get(fc_key)
+    icon_temp  = (forecasts.get("icon")       or {}).get(fc_key)
     wapi_temp  = (forecasts.get("weatherapi") or {}).get(fc_key)
 
     # Require NWS + at least one other model for a market to be shown
-    other_temps     = [t for t in [ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+    other_temps     = [t for t in [ecmwf_temp, gfs_temp, gem_temp, icon_temp, wapi_temp] if t is not None]
     has_enough_data = nws_temp is not None and len(other_temps) >= 1
 
     # Build the models line parts
@@ -1121,9 +1215,11 @@ def _get_model_data(city_key, g, all_forecasts):
     if nws_temp   is not None: parts.append(f"NWS {nws_temp}°")
     if ecmwf_temp is not None: parts.append(f"ECMWF {ecmwf_temp}°")
     if gfs_temp   is not None: parts.append(f"GFS {gfs_temp}°")
+    if gem_temp   is not None: parts.append(f"GEM {gem_temp}°")
+    if icon_temp  is not None: parts.append(f"ICON {icon_temp}°")
     if wapi_temp  is not None: parts.append(f"WAPI {wapi_temp}°")
 
-    all_temps = [t for t in [nws_temp, ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+    all_temps = [t for t in [nws_temp, ecmwf_temp, gfs_temp, gem_temp, icon_temp, wapi_temp] if t is not None]
     spread    = (max(all_temps) - min(all_temps)) if len(all_temps) >= 2 else None
     consensus = round(sum(all_temps) / len(all_temps)) if all_temps else None
 
@@ -1136,6 +1232,8 @@ def _get_model_data(city_key, g, all_forecasts):
         "nws_temp":        nws_temp,
         "ecmwf_temp":      ecmwf_temp,
         "gfs_temp":        gfs_temp,
+        "gem_temp":        gem_temp,
+        "icon_temp":       icon_temp,
         "wapi_temp":       wapi_temp,
         "spread":          spread,
         "consensus":       consensus,
@@ -1272,6 +1370,10 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
         # observations exist yet. Stored so log_to_csv() can write it separately
         # from the grid forecast — keeping both for unambiguous historical analysis.
         observed_running  = None
+        # running: the raw running obs dict (has max_observed/probable_max for HIGH,
+        # min_observed/probable_min for LOW). Initialized to None so Step 3c can
+        # always reference it safely even if we're in a tomorrow branch.
+        running           = None
 
         if date_label == "today" and market["series_type"] == "HIGH":
             nws_grid_forecast = nws_forecast.get("today_high")   # raw grid, always
@@ -1323,6 +1425,8 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
                 (city_forecasts.get("nws")        or {}).get(fc_key),
                 (city_forecasts.get("ecmwf")      or {}).get(fc_key),
                 (city_forecasts.get("gfs")        or {}).get(fc_key),
+                (city_forecasts.get("gem")        or {}).get(fc_key),
+                (city_forecasts.get("icon")       or {}).get(fc_key),
                 (city_forecasts.get("weatherapi") or {}).get(fc_key),
             ]
             valid_temps = [t for t in model_temps if t is not None]
@@ -1367,6 +1471,37 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             # Before 4 AM: no adjustment — overnight low hasn't occurred yet
             std_dev = max(std_dev * time_decay_multiplier, 1.0)
 
+        # --- Step 3c: Hourly forecast adjustment ---
+        # If hourly model data is available, check whether the remaining hours
+        # of today are forecast to exceed the current running extreme.
+        # If the model says they won't, that's corroborating evidence the extreme
+        # has already occurred — tighten std_dev one more notch (×0.7, floor 1.0).
+        # Only applies to today's markets with live observations. Never tomorrow.
+        # Does NOT change forecast_temp — observations are ground truth.
+        hourly_remaining_extreme = None
+        hourly_adjusted          = False
+
+        if date_label == "today" and city_forecasts and city_forecasts.get("hourly"):
+            if market["series_type"] == "HIGH" and observed_running is not None:
+                remaining_high = estimate_remaining_extreme(
+                    city_forecasts["hourly"], city_key, "high"
+                )
+                hourly_remaining_extreme = remaining_high
+                if remaining_high is not None and remaining_high < running["max_observed"]:
+                    # Hourly model agrees the high has already occurred
+                    std_dev        = max(std_dev * 0.7, 1.0)
+                    hourly_adjusted = True
+
+            elif market["series_type"] == "LOW" and observed_running is not None:
+                remaining_low = estimate_remaining_extreme(
+                    city_forecasts["hourly"], city_key, "low"
+                )
+                hourly_remaining_extreme = remaining_low
+                if remaining_low is not None and remaining_low > running["min_observed"]:
+                    # Hourly model agrees the low has already occurred
+                    std_dev        = max(std_dev * 0.7, 1.0)
+                    hourly_adjusted = True
+
         # --- Step 4: Calculate Gaussian-implied probability for this bucket ---
         nws_prob_raw = calculate_gaussian_probability(
             forecast_temp,
@@ -1408,8 +1543,10 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             "edge":          edge,
             "confidence":    confidence,
             "was_settled":      was_settled,
-            "std_dev_used":          std_dev,
-            "time_decay_multiplier": time_decay_multiplier,
+            "std_dev_used":            std_dev,
+            "time_decay_multiplier":   time_decay_multiplier,
+            "hourly_remaining_extreme": hourly_remaining_extreme,
+            "hourly_adjusted":         hourly_adjusted,
             "nws_grid_forecast": nws_grid_forecast,  # raw NWS grid temp (never observed)
             "observed_running":  observed_running,    # live obs if used, else None
         })
@@ -1642,7 +1779,7 @@ def log_to_csv(all_results, all_forecasts):
     Creates the file with a header row if it doesn't exist yet.
     Never overwrites — always appends (this is our ML training data).
 
-    Columns (21 total):
+    Columns (26 total):
       timestamp           — when this cycle ran (YYYY-MM-DD HH:MM:SS)
       city                — city display name
       market_type         — "HIGH" or "LOW"
@@ -1661,8 +1798,10 @@ def log_to_csv(all_results, all_forecasts):
       forecast_temp_used  — the actual temperature that drove the probability calc.
                             For today markets with observations this equals
                             observed_running; otherwise equals nws_grid_forecast.
-      ecmwf_high          — Open-Meteo ECMWF IFS 0.4° model forecast temp (°F)
+      ecmwf_high          — Open-Meteo ECMWF IFS 0.25° model forecast temp (°F)
       gfs_high            — Open-Meteo GFS Seamless model forecast temp (°F)
+      gem_high            — Open-Meteo Canadian GEM Seamless model forecast temp (°F)
+      icon_high           — Open-Meteo DWD ICON Seamless model forecast temp (°F)
       weatherapi_high     — WeatherAPI.com forecast temp for this period (°F)
       consensus_high      — average of all available model temps (rounded, °F)
       model_spread        — max − min across all available models (°F); high = stay out
@@ -1671,16 +1810,26 @@ def log_to_csv(all_results, all_forecasts):
                               progresses (1.0 = no decay; 0.75/0.5/0.3 = tightening).
                               Only set for today markets with live observations; always
                               1.0 for tomorrow markets and today markets without obs.
+      hourly_remaining_extreme — Open-Meteo hourly model's forecasted max (HIGH) or min
+                              (LOW) for the remaining hours of today in LST. Empty for
+                              tomorrow markets and when hourly data is unavailable.
+      hourly_adjusted     — True if the hourly model caused an additional ×0.7 std_dev
+                              tightening (i.e. hourly agreed the extreme already occurred).
       ticker              — Kalshi market ticker (used by resolve.py for result lookup)
       market_date         — "today" or "tomorrow" from the signal's perspective
+
+    SCHEMA CHANGE: added hourly_remaining_extreme and hourly_adjusted columns (now 26
+    total, was 24). If log.csv exists with the old schema, delete it and restart —
+    the bot will recreate it with the correct 26-column header.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
         "kalshi_price", "nws_implied", "gap", "direction",
         "confidence", "was_settled",
         "nws_grid_forecast", "observed_running", "forecast_temp_used",
-        "ecmwf_high", "gfs_high", "weatherapi_high",
+        "ecmwf_high", "gfs_high", "gem_high", "icon_high", "weatherapi_high",
         "consensus_high", "model_spread", "std_dev_used", "time_decay_multiplier",
+        "hourly_remaining_extreme", "hourly_adjusted",
         "ticker", "market_date",
     ]
 
@@ -1722,6 +1871,8 @@ def log_to_csv(all_results, all_forecasts):
                 nws_fc      = forecasts.get("nws")        or {}
                 ecmwf_fc    = forecasts.get("ecmwf")      or {}
                 gfs_fc      = forecasts.get("gfs")        or {}
+                gem_fc      = forecasts.get("gem")        or {}
+                icon_fc     = forecasts.get("icon")       or {}
                 wapi_fc     = forecasts.get("weatherapi") or {}
 
                 for g in gaps:
@@ -1730,12 +1881,14 @@ def log_to_csv(all_results, all_forecasts):
                     fc_key = f"{g['market_date']}_{g['series_type'].lower()}"
 
                     nws_temp    = nws_fc.get(fc_key)    # NWS grid °F
-                    ecmwf_temp  = ecmwf_fc.get(fc_key)  # ECMWF IFS 0.4° °F
+                    ecmwf_temp  = ecmwf_fc.get(fc_key)  # ECMWF IFS 0.25° °F
                     gfs_temp    = gfs_fc.get(fc_key)    # GFS Seamless °F
+                    gem_temp    = gem_fc.get(fc_key)    # Canadian GEM Seamless °F
+                    icon_temp   = icon_fc.get(fc_key)   # DWD ICON Seamless °F
                     wapi_temp   = wapi_fc.get(fc_key)   # WeatherAPI.com °F
 
                     # Consensus = average of all available model temps (including NWS)
-                    available = [t for t in [nws_temp, ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
+                    available = [t for t in [nws_temp, ecmwf_temp, gfs_temp, gem_temp, icon_temp, wapi_temp] if t is not None]
                     consensus = round(sum(available) / len(available)) if available else None
                     # Spread = range across models; high spread = stay out (low confidence)
                     spread    = (max(available) - min(available)) if len(available) >= 2 else None
@@ -1763,11 +1916,15 @@ def log_to_csv(all_results, all_forecasts):
                         "forecast_temp_used": fc_used   if fc_used  is not None else "",
                         "ecmwf_high":         ecmwf_temp if ecmwf_temp is not None else "",
                         "gfs_high":           gfs_temp   if gfs_temp   is not None else "",
+                        "gem_high":           gem_temp   if gem_temp   is not None else "",
+                        "icon_high":          icon_temp  if icon_temp  is not None else "",
                         "weatherapi_high":    wapi_temp  if wapi_temp  is not None else "",
                         "consensus_high":     consensus  if consensus  is not None else "",
                         "model_spread":       spread     if spread     is not None else "",
                         "std_dev_used":          g.get("std_dev_used", ""),
                         "time_decay_multiplier": g.get("time_decay_multiplier", 1.0),
+                        "hourly_remaining_extreme": g.get("hourly_remaining_extreme", "") if g.get("hourly_remaining_extreme") is not None else "",
+                        "hourly_adjusted":          g.get("hourly_adjusted", False),
                         "ticker":             g["ticker"],
                         "market_date":        g["market_date"],
                     })
@@ -1899,18 +2056,29 @@ def run_cycle():
                 continue
 
             # ── Step 3: Multi-model forecasts (non-blocking) ─────────────────
-            # All three can fail without skipping the city — NWS drives signals.
+            # All six can fail without skipping the city — NWS drives signals.
             ecmwf_forecast      = fetch_ecmwf_forecast(city_key)
             gfs_forecast        = fetch_gfs_forecast(city_key)
+            gem_forecast        = fetch_gem_forecast(city_key)
+            icon_forecast       = fetch_icon_forecast(city_key)
             weatherapi_forecast = fetch_weatherapi_forecast(city_key)
+            hourly_forecast     = fetch_hourly_forecast(city_key)
 
             # Log whether each model returned data or None
+            def _fc_status(fc, label):
+                if fc:
+                    return f"{label}: ok (today_high={fc.get('today_high')})"
+                return f"{label}: None"
             log.info(
-                f"[{city_key}] Forecast status — "
-                f"NWS: ok, "
-                f"ECMWF: {'ok (today_high=' + str(ecmwf_forecast.get('today_high')) + ')' if ecmwf_forecast else 'None'}, "
-                f"GFS: {'ok (today_high=' + str(gfs_forecast.get('today_high')) + ')' if gfs_forecast else 'None'}, "
-                f"WAPI: {'ok' if weatherapi_forecast else 'None'}"
+                f"[{city_key}] Forecast status — NWS: ok, "
+                + ", ".join([
+                    _fc_status(ecmwf_forecast,      "ECMWF"),
+                    _fc_status(gfs_forecast,         "GFS"),
+                    _fc_status(gem_forecast,         "GEM"),
+                    _fc_status(icon_forecast,        "ICON"),
+                    "WAPI: ok" if weatherapi_forecast else "WAPI: None",
+                    f"Hourly: ok ({len(hourly_forecast)} hrs)" if hourly_forecast else "Hourly: None",
+                ])
             )
 
             # Bundle forecasts so analyze_gaps() can compute dynamic std_dev
@@ -1918,7 +2086,10 @@ def run_cycle():
                 "nws":        nws_forecast,
                 "ecmwf":      ecmwf_forecast,
                 "gfs":        gfs_forecast,
+                "gem":        gem_forecast,
+                "icon":       icon_forecast,
                 "weatherapi": weatherapi_forecast,
+                "hourly":     hourly_forecast,
             }
 
             # ── Step 4: Gap analysis ─────────────────────────────────────────
