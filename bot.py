@@ -1657,9 +1657,10 @@ def format_alert_message(all_results, all_forecasts):
         """Renders a list of markets as card lines."""
         card_lines = []
         for g in market_list:
-            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 3) else ""
+            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 5) else ""
             card_lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
             card_lines.append(f"Kalshi: {g['kalshi_prob']}%")
+            card_lines.append(f"Model: {g['nws_prob']}% → {g['edge']} (gap: {g['gap']:+d}%)")
             card_lines.append(g["models_line"] + spread_tag)
             card_lines.append(DIVIDER)
         return card_lines
@@ -1988,9 +1989,10 @@ def format_evening_summary(all_results, all_forecasts):
 
     if tomorrow_markets:
         for g in tomorrow_markets:
-            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 3) else ""
+            spread_tag = "  ⚠️ HIGH SPREAD" if (g["spread"] is not None and g["spread"] >= 5) else ""
             lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
             lines.append(f"Kalshi: {g['kalshi_prob']}%")
+            lines.append(f"Model: {g['nws_prob']}% → {g['edge']} (gap: {g['gap']:+d}%)")
             lines.append(g["models_line"] + spread_tag)
             lines.append(DIVIDER)
     else:
