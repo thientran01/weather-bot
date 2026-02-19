@@ -557,18 +557,20 @@ def fetch_nws_forecast(city_key):
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         result = {
-            "today_high":        forecasts.get(today,    {}).get("high"),
-            "today_low":         forecasts.get(today,    {}).get("low"),
-            "tomorrow_high":     forecasts.get(tomorrow, {}).get("high"),
-            "tomorrow_low":      forecasts.get(tomorrow, {}).get("low"),
+            "today_high":         forecasts.get(today,    {}).get("high"),
+            "today_low":          forecasts.get(today,    {}).get("low"),
+            "tomorrow_high":      forecasts.get(tomorrow, {}).get("high"),
+            "tomorrow_low":       forecasts.get(tomorrow, {}).get("low"),
             "today_running_high": None,   # filled below from live observations
+            "today_running_low":  None,   # filled below from live observations
         }
 
-        # Fetch actual observed running high for today from the station.
-        # This is more reliable than the grid forecast once the day is in
-        # progress. Returns None if no observations exist yet (e.g. very
-        # early morning) or if the API call fails — safe to ignore.
+        # Fetch actual observed running high and low for today from the station.
+        # Once the day is in progress, real observations are more accurate than
+        # a forecast issued hours earlier. Returns None if no observations exist
+        # yet (e.g. very early morning) or if the API call fails — safe to ignore.
         result["today_running_high"] = get_current_running_high(city_key)
+        result["today_running_low"]  = get_current_running_low(city_key)
 
         return result
 
@@ -785,6 +787,166 @@ def get_current_running_high(city_key):
         return None
     except Exception as e:
         log.error(f"[{city_key}] Unexpected error in running high fetch: {e}")
+        return None
+
+
+# ============================================================
+# SECTION 5b-LOW — RUNNING LOW FROM OBSERVATIONS
+# Mirror image of get_current_running_high() for LOW markets.
+# Fetches actual observed temperatures from NWS since midnight
+# LST and returns the lowest value seen so far today.
+# Used in place of the grid forecast for TODAY's LOW markets.
+#
+# Key differences from get_current_running_high():
+#   - Tracks running minimum instead of maximum
+#   - No DSM field: there is no minTemperatureLast24Hours in the
+#     NWS observations API, so that section is omitted entirely
+#   - probable_min uses floor((C - 0.05) × 9/5 + 32) as the lower
+#     bound — the stored Celsius could be 0.05°C higher than true,
+#     meaning the true converted minimum might be 1°F lower
+# ============================================================
+
+def get_current_running_low(city_key):
+    """
+    Fetches today's actual observed temperature readings from the NWS
+    observations API and returns the lowest value recorded since midnight LST.
+
+    This replaces the NWS grid forecast for TODAY's LOW markets because once
+    the day is in progress, real observations are more accurate than a forecast
+    that may have been issued many hours ago.
+
+    Uses the same LST midnight calculation as get_current_running_high() —
+    see that function's docstring for the full explanation of why we use LST
+    rather than civil time (short version: Kalshi resolves on LST windows,
+    not civil-time midnight, so a summer ET city still uses UTC-5, not UTC-4).
+
+    --- CELSIUS ROUNDING LOGIC (5-minute ASOS stations) ---
+    ASOS stations store temperature in Celsius to 0.1°C precision.
+    Official °F = floor(C × 9/5 + 32). A stored value of, say, 10.0°C
+    represents the range [9.95, 10.05)°C — the true temperature could be
+    up to 0.05°C lower. We track two values:
+
+        min_observed  = min of floor(C × 9/5 + 32)            — conservative
+        probable_min  = min of floor((C - 0.05) × 9/5 + 32)  — lower bound
+
+    For cooperative observer (hourly) stations the original reading was a
+    whole °F, so round() recovers it exactly and there is no lower-bound
+    ambiguity (probable_min == min_observed).
+
+    --- NO DSM EQUIVALENT ---
+    ASOS DSM broadcasts include maxTemperatureLast24Hours but NOT a
+    minTemperatureLast24Hours field, so we cannot apply the same DSM
+    override that get_current_running_high() uses. The observed readings
+    from the time series are the only source for the running low.
+
+    Returns:
+      {"min_observed": int, "probable_min": int, "obs_count": int}
+        on success (at least one valid reading found)
+      None  if no readings exist yet or the API call fails.
+    """
+    city         = CITIES[city_key]
+    station      = city["nws_station"]
+    station_type = city["station_type"]
+    lst_offset   = city["lst_utc_offset"]   # standard time offset, e.g. -5 for EST
+
+    headers = {"User-Agent": "KalshiClimateBot/1.0"}
+
+    # ── Step 1: Find midnight LST in UTC (identical to running high) ─────────
+    now_utc      = datetime.utcnow()
+    now_lst      = now_utc + timedelta(hours=lst_offset)
+    lst_midnight = now_lst.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_midnight = lst_midnight - timedelta(hours=lst_offset)
+    start_utc_str = utc_midnight.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    log.info(
+        f"[{city_key}] Running low: querying {station} obs since "
+        f"{start_utc_str} UTC (= midnight LST, offset {lst_offset:+d}h)"
+    )
+
+    try:
+        response = requests.get(
+            f"https://api.weather.gov/stations/{station}/observations",
+            params={"start": start_utc_str, "limit": 500},
+            headers=headers,
+            timeout=15,
+        )
+        response.raise_for_status()
+        features = response.json().get("features", [])
+
+        if not features:
+            log.info(f"[{city_key}] No observations found since midnight LST.")
+            return None
+
+        min_observed = None   # conservative min: floor(C × 9/5 + 32) for 5-min stations
+        probable_min = None   # lower bound: floor((C - 0.05) × 9/5 + 32)
+        valid_count  = 0      # number of observations with a valid temperature reading
+
+        for feature in features:
+            props = feature.get("properties", {})
+
+            # ── Read the individual temperature observation ──────────────────
+            # (No DSM min field exists in the NWS observations API — skip.)
+            temp_obj = props.get("temperature", {})
+            if not temp_obj or temp_obj.get("value") is None:
+                # Observation exists but has no temperature (e.g. a SPECI report
+                # with only wind/pressure data). Skip it.
+                continue
+
+            raw_value = temp_obj["value"]
+            unit_code = temp_obj.get("unitCode", "")
+
+            # The NWS API always returns temperature in Celsius (wmoUnit:degC),
+            # but we guard against surprises just in case.
+            if "degF" in unit_code:
+                celsius = (raw_value - 32) * 5 / 9
+            else:
+                celsius = raw_value   # already °C
+
+            if station_type == "5-minute":
+                # ── ASOS 5-minute station ────────────────────────────────────
+                # Official °F = floor(C × 9/5 + 32). The stored Celsius could
+                # be up to 0.05°C higher than the true value (precision limit),
+                # meaning the true minimum might be 1°F lower. We track:
+                #   conservative: floor(C × 9/5 + 32)
+                #   lower_bound:  floor((C - 0.05) × 9/5 + 32)
+                conservative = math.floor(celsius * 9 / 5 + 32)
+                lower_bound  = math.floor((celsius - 0.05) * 9 / 5 + 32)
+
+            else:
+                # ── Cooperative observer (hourly) station, e.g. KNYC ─────────
+                # Original whole °F reading; round() recovers it exactly.
+                # No lower-bound ambiguity applies.
+                conservative = round(celsius * 9 / 5 + 32)
+                lower_bound  = conservative
+
+            # Update rolling minimums
+            if min_observed is None or conservative < min_observed:
+                min_observed = conservative
+            if probable_min is None or lower_bound < probable_min:
+                probable_min = lower_bound
+
+            valid_count += 1
+
+        if min_observed is None:
+            log.info(f"[{city_key}] {len(features)} observations found but none had temperature data.")
+            return None
+
+        log.info(
+            f"[{city_key}] Running low: {min_observed}°F "
+            f"(probable_min: {probable_min}°F, "
+            f"{valid_count} valid readings from {len(features)} obs)"
+        )
+        return {
+            "min_observed": min_observed,   # conservative official low so far today
+            "probable_min": probable_min,   # lower bound accounting for C→F rounding
+            "obs_count":    valid_count,    # number of individual readings processed
+        }
+
+    except requests.exceptions.RequestException as e:
+        log.error(f"[{city_key}] Running low fetch failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"[{city_key}] Unexpected error in running low fetch: {e}")
         return None
 
 
@@ -1081,11 +1243,14 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             continue  # skip markets for other dates
 
         # --- Step 2: Pick the best available temperature for this date + series ---
-        # For today's HIGH markets we prefer the actual observed running high
-        # (from Section 5b) over the grid forecast, because once observations
-        # exist they are more accurate than a forecast issued hours earlier.
-        # For all other combinations (today LOW, tomorrow HIGH/LOW) we use the
-        # NWS grid forecast as usual.
+        # For today's HIGH and LOW markets we prefer actual observed running
+        # values (from Sections 5b/5b-LOW) over the grid forecast, because once
+        # observations exist they are more accurate than a forecast issued hours
+        # earlier. For tomorrow's markets we always use the NWS grid forecast.
+
+        # probable_min_temp mirrors probable_max_temp for LOW markets:
+        # set only when running low observations are available, None otherwise.
+        probable_min_temp = None
 
         if date_label == "today" and market["series_type"] == "HIGH":
             running = nws_forecast.get("today_running_high")
@@ -1100,7 +1265,15 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
                 forecast_temp     = nws_forecast["today_high"]
                 probable_max_temp = None
         elif date_label == "today" and market["series_type"] == "LOW":
-            forecast_temp     = nws_forecast["today_low"]
+            running = nws_forecast.get("today_running_low")
+            if running is not None:
+                # Use the conservative observed min (floor(C×9/5+32)).
+                # probable_min is stored in the result for display purposes.
+                forecast_temp     = running["min_observed"]
+                probable_min_temp = running["probable_min"]
+            else:
+                # Fall back to the grid forecast if observations aren't available.
+                forecast_temp     = nws_forecast["today_low"]
             probable_max_temp = None
         elif date_label == "tomorrow" and market["series_type"] == "HIGH":
             forecast_temp     = nws_forecast["tomorrow_high"]
@@ -1167,6 +1340,7 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             "market_date":   date_label,
             "forecast_temp": forecast_temp,
             "probable_max":  probable_max_temp,        # upper bound for today HIGH obs only
+            "probable_min":  probable_min_temp,        # lower bound for today LOW obs only
             "kalshi_prob":   market["kalshi_prob"],
             "nws_prob":      nws_prob,
             "gap":           gap,
