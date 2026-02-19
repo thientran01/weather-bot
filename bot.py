@@ -1573,8 +1573,8 @@ def _apply_email_filters(g, md):
     Rule 2 — Require an edge: |gap| ≥ 15%.
               A gap smaller than 15pp isn't worth acting on after fees.
 
-    Rule 3 — Exclude high uncertainty: model spread < 4°F.
-              When models disagree by ≥4° there's no reliable signal.
+    Rule 3 — Exclude high uncertainty: model spread < 8°F.
+              When models disagree by ≥8° there's no reliable signal.
 
     Rule 4 — Exclude impossible outcomes: consensus within 5°F of bucket.
               If all models agree the temp is 10° below a FLOOR boundary,
@@ -1590,7 +1590,7 @@ def _apply_email_filters(g, md):
         return False
 
     # Rule 3: models must broadly agree
-    if md["spread"] is not None and md["spread"] >= 4:
+    if md["spread"] is not None and md["spread"] >= 8:
         return False
 
     # Rule 4: consensus within 5°F of bucket boundaries
