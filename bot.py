@@ -992,8 +992,11 @@ def _fetch_openmeteo_model(city_key, model):
         highs = data["daily"]["temperature_2m_max"]
         lows  = data["daily"]["temperature_2m_min"]
 
-        today    = datetime.now().strftime("%Y-%m-%d")
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Use UTC date — Open-Meteo starts its daily forecast from the UTC current
+        # date, so matching against local time would miss "today" after 7 PM ET
+        # (when UTC has already rolled to the next day).
+        today    = datetime.utcnow().strftime("%Y-%m-%d")
+        tomorrow = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         result = {"today_high": None, "today_low": None, "tomorrow_high": None, "tomorrow_low": None}
 
@@ -1023,8 +1026,8 @@ def _fetch_openmeteo_model(city_key, model):
 
 
 def fetch_ecmwf_forecast(city_key):
-    """Fetches the ECMWF IFS 0.4° model forecast from Open-Meteo. Free, no key needed."""
-    return _fetch_openmeteo_model(city_key, "ecmwf_ifs04")
+    """Fetches the ECMWF IFS 0.25° model forecast from Open-Meteo. Free, no key needed."""
+    return _fetch_openmeteo_model(city_key, "ecmwf_ifs025")
 
 
 def fetch_gfs_forecast(city_key):
@@ -1852,6 +1855,15 @@ def run_cycle():
             ecmwf_forecast      = fetch_ecmwf_forecast(city_key)
             gfs_forecast        = fetch_gfs_forecast(city_key)
             weatherapi_forecast = fetch_weatherapi_forecast(city_key)
+
+            # Log whether each model returned data or None
+            log.info(
+                f"[{city_key}] Forecast status — "
+                f"NWS: ok, "
+                f"ECMWF: {'ok (today_high=' + str(ecmwf_forecast.get('today_high')) + ')' if ecmwf_forecast else 'None'}, "
+                f"GFS: {'ok (today_high=' + str(gfs_forecast.get('today_high')) + ')' if gfs_forecast else 'None'}, "
+                f"WAPI: {'ok' if weatherapi_forecast else 'None'}"
+            )
 
             # Bundle forecasts so analyze_gaps() can compute dynamic std_dev
             city_forecasts = {
