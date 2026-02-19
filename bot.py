@@ -15,8 +15,10 @@ import math
 import time
 import logging
 import schedule
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from scipy.stats import norm
 import requests
@@ -1755,13 +1757,79 @@ def reset_daily_state():
 
 
 # ============================================================
-# SECTION 10 — SCHEDULER + ENTRY POINT
+# SECTION 10 — HTTP EXPORT SERVER
+#
+# Serves log.csv as a file download at GET /  (and GET /export).
+# Railway exposes the PORT env var; locally we default to 8080.
+#
+# Usage from browser or curl:
+#   curl http://localhost:8080/export -o log.csv
+# ============================================================
+
+LOG_PATH = os.getenv("LOG_PATH", "log.csv")
+
+
+class ExportHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler — only serves log.csv as a download."""
+
+    def do_GET(self):
+        # Accept both / and /export so Railway health checks don't 404
+        if self.path not in ("/", "/export"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if not os.path.isfile(LOG_PATH):
+            # No data yet — return an empty 200 so callers don't crash
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", 'attachment; filename="log.csv"')
+            self.end_headers()
+            return
+
+        try:
+            with open(LOG_PATH, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", 'attachment; filename="log.csv"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            log.error(f"ExportHandler error: {exc}")
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        # Silence the default per-request stdout noise; our logger handles it
+        log.debug("HTTP %s", fmt % args)
+
+
+def run_http_server():
+    """Start the export HTTP server on PORT (default 8080). Blocks forever."""
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), ExportHandler)
+    log.info(f"Export server listening on port {port}  (GET / or /export → log.csv)")
+    server.serve_forever()
+
+
+# ============================================================
+# SECTION 11 — SCHEDULER + ENTRY POINT
 #
 # Usage:
 #   python bot.py          — production mode: runs forever
 #   python bot.py --test   — test mode: runs one cycle then exits
 #                            (useful for verifying the heartbeat without
 #                            starting a long-running process)
+#
+# Threading model:
+#   - Scheduler loop runs in a background daemon thread so it never
+#     blocks the HTTP server.
+#   - HTTP server runs on the main thread (required by Railway: the
+#     process must bind the PORT it's given or it won't route traffic).
+#   - Because the scheduler thread is a daemon, it exits automatically
+#     when the main thread (HTTP server) stops.
 # ============================================================
 
 if __name__ == "__main__":
@@ -1779,6 +1847,7 @@ if __name__ == "__main__":
     log.info( "    ⚡  Intraday — spread convergence alert (when ≥3° spread drops to <1°)")
     log.info( "    🌙  8:00 PM — evening summary (tomorrow markets + today's highs)")
     log.info( "  Daily state reset at midnight UTC")
+    log.info( "  Export server: GET /export → log.csv")
     if test_mode:
         log.info("  Mode: --test (will exit after first cycle)")
     if SEND_TEST_EMAIL:
@@ -1786,39 +1855,36 @@ if __name__ == "__main__":
     log.info("=" * 58)
 
     # ── Run one full cycle immediately on startup ────────────────────────────
-    # This gives you output right away instead of waiting RUN_EVERY_MINUTES.
     log.info("Running initial cycle on startup...")
     startup_results, startup_forecasts = run_cycle()
 
     # ── Optional test email ──────────────────────────────────────────────────
-    # Set SEND_TEST_EMAIL=true in Railway to confirm SendGrid is working.
-    # Remove the variable (or set it to false) once you've verified delivery.
     if SEND_TEST_EMAIL:
         send_test_email(startup_results, startup_forecasts)
 
     if test_mode:
-        # --test flag: verify the heartbeat printed, then stop cleanly.
         log.info("--test complete. Exiting.")
         sys.exit(0)
 
     # ── Schedule recurring jobs ──────────────────────────────────────────────
-
-    # Main market cycle every 10 minutes (fetches data, checks spread, decides email)
     schedule.every(RUN_EVERY_MINUTES).minutes.do(run_cycle)
-
-    # Reset spread-tracking state at midnight UTC each day
     schedule.every().day.at("00:00").do(reset_daily_state)
 
-    log.info(
-        f"Scheduler active. "
-        f"Market cycle every {RUN_EVERY_MINUTES} min. "
-        f"Press Ctrl+C to stop."
-    )
-
-    # ── Main loop ────────────────────────────────────────────────────────────
-    try:
+    # ── Scheduler runs in a background daemon thread ─────────────────────────
+    def _run_scheduler():
+        log.info(
+            f"Scheduler active. "
+            f"Market cycle every {RUN_EVERY_MINUTES} min."
+        )
         while True:
             schedule.run_pending()
-            time.sleep(1)
+            time.sleep(30)
+
+    scheduler_thread = threading.Thread(target=_run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # ── HTTP export server on main thread (blocks until Ctrl+C / SIGTERM) ───
+    try:
+        run_http_server()
     except KeyboardInterrupt:
         log.info("\nKalshi Climate Bot stopped by user. Goodbye.")

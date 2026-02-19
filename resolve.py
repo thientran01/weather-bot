@@ -1,15 +1,19 @@
 """
 Kalshi Resolution Checker
 -------------------------
-Runs every morning at 8 AM ET. Reads yesterday's HIGH-confidence signals
+Runs every morning at 9:30 AM ET. Reads yesterday's HIGH-confidence signals
 from log.csv, checks the Kalshi API to see what each market actually
-resolved to, and prints a daily accuracy summary broken down by city and
+resolved to, and prints a daily PnL summary broken down by city and
 by HIGH vs LOW market type.
+
+9:30 AM ET (6:30 AM PT) gives West Coast markets (LAX, SFO, SEA) time to
+settle before we check — their NWS offices may not have filed the official
+daily report by 8 AM ET.
 
 Results are also appended to resolve_log.csv for historical tracking.
 
 Usage:
-  python resolve.py          — schedule mode: checks at 8 AM ET daily
+  python resolve.py          — schedule mode: checks at 9:30 AM ET daily
   python resolve.py --now    — run immediately (for testing)
 
 Requirements: same .env as bot.py (no extra credentials needed — Kalshi
@@ -39,8 +43,8 @@ KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 LOG_FILE    = os.getenv("LOG_PATH",         "log.csv")
 RESOLVE_LOG = os.getenv("RESOLVE_LOG_PATH", "resolve_log.csv")
 
-# Date guard — prevents the 8 AM check from firing twice if the process
-# is still running when the scheduler ticks at 8:01 AM.
+# Date guard — prevents the 9:30 AM check from firing twice if the process
+# is still running when the scheduler ticks a minute later.
 _RAN_FOR_DATE = None
 
 logging.basicConfig(
@@ -54,7 +58,7 @@ log = logging.getLogger(__name__)
 RESOLVE_FIELDNAMES = [
     "date", "city", "market_type", "bucket_label", "ticker",
     "direction", "kalshi_price", "nws_implied", "gap",
-    "result", "resolved_correct",
+    "result", "resolved_correct", "pnl_cents",
 ]
 
 
@@ -204,25 +208,30 @@ def write_resolve_log(rows):
 
 
 # ============================================================
-# SECTION 5 — ACCURACY SUMMARY PRINTER
+# SECTION 5 — PnL SUMMARY PRINTER
 # ============================================================
 
 def print_summary(date_str, rows):
     """
-    Prints the daily accuracy summary to stdout.
+    Prints the daily PnL summary to stdout.
+
+    pnl_cents is calculated per-trade assuming 1-unit position size:
+      BUY YES at entry_price:  win = +(100 - entry), loss = -entry
+      BUY NO  at entry_price:  win = +entry,          loss = -(100 - entry)
 
     Shows:
-      - Overall correct / incorrect / hit rate
+      - Net PnL and win rate for the day
       - Breakdown by market type (HIGH vs LOW)
-      - Breakdown by city with HIGH and LOW columns side by side
+      - Breakdown by city with net PnL per city
     """
     total   = len(rows)
+    net_pnl = sum(r["pnl_cents"] for r in rows)
     correct = sum(1 for r in rows if r["resolved_correct"] is True)
 
     DIVIDER = "=" * 52
 
     print(f"\n{DIVIDER}")
-    print(f"  ACCURACY SUMMARY — {date_str}")
+    print(f"  PnL SUMMARY — {date_str}")
     print(f"{DIVIDER}")
 
     if total == 0:
@@ -231,39 +240,40 @@ def print_summary(date_str, rows):
         print(f"{DIVIDER}\n")
         return
 
-    print(f"  Signals checked : {total}")
-    print(f"  Correct         : {correct}  ({correct / total * 100:.1f}%)")
-    print(f"  Incorrect       : {total - correct}")
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    print(f"  Trades evaluated : {total}")
+    print(f"  Net PnL          : {pnl_sign}{net_pnl:.0f}¢  (${net_pnl / 100:.2f} per unit)")
+    print(f"  Win rate         : {correct}/{total} ({correct / total * 100:.1f}%)")
     print()
 
     # ── By market type ──────────────────────────────────────────────────
-    print(f"  {'TYPE':<6}  {'CORRECT':>7}  {'TOTAL':>5}  {'HIT RATE':>9}")
-    print(f"  {'-' * 34}")
+    print(f"  {'TYPE':<6}  {'TRADES':>6}  {'NET PnL':>9}  {'AVG PnL':>9}")
+    print(f"  {'-' * 38}")
     for mtype in ("HIGH", "LOW"):
         subset = [r for r in rows if r["market_type"] == mtype]
         if not subset:
             continue
-        c = sum(1 for r in subset if r["resolved_correct"])
-        print(f"  {mtype:<6}  {c:>7}  {len(subset):>5}  {c / len(subset) * 100:>8.1f}%")
+        sp   = sum(r["pnl_cents"] for r in subset)
+        avg  = sp / len(subset)
+        print(f"  {mtype:<6}  {len(subset):>6}  {'+' if sp >= 0 else ''}{sp:>7.0f}¢  {'+' if avg >= 0 else ''}{avg:>7.1f}¢")
 
     print()
 
     # ── By city ─────────────────────────────────────────────────────────
-    def fraction(subset):
-        """Returns 'C/T (R%)' or '—' if the subset is empty."""
+    def pnl_str(subset):
+        """Returns 'PnL¢/N trades' or '—' if the subset is empty."""
         if not subset:
             return "—"
-        c = sum(1 for r in subset if r["resolved_correct"])
-        t = len(subset)
-        return f"{c}/{t} ({c / t * 100:.0f}%)"
+        sp = sum(r["pnl_cents"] for r in subset)
+        return f"{'+' if sp >= 0 else ''}{sp:.0f}¢/{len(subset)}"
 
-    print(f"  {'CITY':<22}  {'HIGH':>12}  {'LOW':>10}")
-    print(f"  {'-' * 50}")
+    print(f"  {'CITY':<22}  {'HIGH':>10}  {'LOW':>8}")
+    print(f"  {'-' * 46}")
     for city in sorted({r["city"] for r in rows}):
         city_rows = [r for r in rows if r["city"] == city]
-        high_str  = fraction([r for r in city_rows if r["market_type"] == "HIGH"])
-        low_str   = fraction([r for r in city_rows if r["market_type"] == "LOW"])
-        print(f"  {city:<22}  {high_str:>12}  {low_str:>10}")
+        high_str  = pnl_str([r for r in city_rows if r["market_type"] == "HIGH"])
+        low_str   = pnl_str([r for r in city_rows if r["market_type"] == "LOW"])
+        print(f"  {city:<22}  {high_str:>10}  {low_str:>8}")
 
     print(f"{DIVIDER}\n")
 
@@ -313,17 +323,37 @@ def run_resolution_check():
             log.info(f"  {ticker}: not yet settled — skipping")
             continue
 
-        direction = row["direction"]   # "BUY YES" or "BUY NO"
-        correct   = (
+        direction   = row["direction"]   # "BUY YES" or "BUY NO"
+        entry_price = float(row["kalshi_price"])
+        correct     = (
             (direction == "BUY YES" and result == "yes") or
             (direction == "BUY NO"  and result == "no")
         )
 
-        # Log each market result to console with a clear icon
+        # PnL in cents, assuming 1-unit position at the logged Kalshi price.
+        #
+        # BUY YES at entry_price (e.g. 22¢):
+        #   Win (YES settles 100): you paid 22¢, receive 100¢ → gain 78¢
+        #   Loss (YES settles 0):  you paid 22¢, receive 0¢  → lose 22¢
+        #
+        # BUY NO at entry_price (e.g. 22¢ for YES = 78¢ for NO):
+        #   "Buying NO" at a YES price of 22¢ means you pay (100 - 22) = 78¢.
+        #   Win (NO wins, YES settles 0):  receive 100¢, paid 78¢ → gain 22¢ (= entry_price)
+        #   Loss (NO loses, YES settles 100): receive 0¢, paid 78¢ → lose 78¢ (= 100 - entry_price)
+        if result in ("void", "voided"):
+            pnl = 0.0   # refunded — no gain or loss
+        elif direction == "BUY YES":
+            pnl = (100 - entry_price) if result == "yes" else -entry_price
+        else:  # BUY NO
+            pnl = entry_price if result == "no" else -(100 - entry_price)
+
+        # Log each market result to console with a clear icon and PnL
         prov_tag = " (provisional)" if provisional else ""
         icon     = "✅" if correct else "❌"
+        pnl_sign = "+" if pnl >= 0 else ""
         log.info(
-            f"  {icon} {ticker}: signal={direction}, resolved={result}{prov_tag}, correct={correct}"
+            f"  {icon} {ticker}: signal={direction}, resolved={result}{prov_tag}, "
+            f"pnl={pnl_sign}{pnl:.0f}¢"
         )
 
         resolved_rows.append({
@@ -338,6 +368,7 @@ def run_resolution_check():
             "gap":              row["gap"],
             "result":           result,
             "resolved_correct": correct,
+            "pnl_cents":        pnl,
         })
 
     write_resolve_log(resolved_rows)
@@ -348,19 +379,25 @@ def run_resolution_check():
 # SECTION 7 — SCHEDULER + ENTRY POINT
 #
 # Usage:
-#   python resolve.py          — schedule mode: fires at 8:00 AM ET daily
+#   python resolve.py          — schedule mode: fires at 9:30 AM ET daily
 #   python resolve.py --now    — run one check immediately and exit
 #
-# Why not schedule.every().day.at("08:00")?
-# The schedule library uses local system time. On Railway (UTC), "08:00"
-# would mean 8 AM UTC, not 8 AM ET. Instead, we check every minute and
-# fire when it's 8 AM in America/New_York — correct regardless of DST.
+# Why not schedule.every().day.at("09:30")?
+# The schedule library uses local system time. On Railway (UTC), "09:30"
+# would mean 9:30 AM UTC, not 9:30 AM ET. Instead, we check every minute
+# and fire when it's 9:30 AM in America/New_York — correct regardless of DST.
+#
+# Why 9:30 AM ET (not 8 AM)?
+# West Coast stations (LAX, SFO, SEA) are UTC-8. Their Kalshi markets
+# resolve at midnight PST = 8:00 AM UTC = 3:00 AM ET, but the NWS office
+# may not publish the official daily summary until well after that. 9:30 AM
+# ET = 6:30 AM PT gives them enough time to file before we check.
 # ============================================================
 
 def _maybe_run():
-    """Called every minute — fires the check at 8:00 AM ET, once per day."""
+    """Called every minute — fires the check at 9:30 AM ET, once per day."""
     et_now = datetime.now(tz=ZoneInfo("America/New_York"))
-    if et_now.hour == 8 and _RAN_FOR_DATE != et_now.date():
+    if et_now.hour == 9 and et_now.minute >= 30 and _RAN_FOR_DATE != et_now.date():
         run_resolution_check()
 
 
@@ -376,7 +413,7 @@ if __name__ == "__main__":
     log.info("  Kalshi Resolution Checker")
     log.info(f"  Reading signals from  : {LOG_FILE}")
     log.info(f"  Writing results to    : {RESOLVE_LOG}")
-    log.info("  Schedule              : 8:00 AM ET daily")
+    log.info("  Schedule              : 9:30 AM ET daily")
     log.info("  Run with --now to test immediately")
     log.info("=" * 52)
 
