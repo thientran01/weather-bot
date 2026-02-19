@@ -552,9 +552,16 @@ def fetch_nws_forecast(city_key):
             else:
                 forecasts[date_str]["low"] = temp
 
-        # Build today's and tomorrow's date strings to look up in our forecasts dict
-        today    = datetime.now().strftime("%Y-%m-%d")
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Build today's and tomorrow's date strings to look up in our forecasts dict.
+        # NWS startTime dates (e.g. "2026-02-18T06:00:00-05:00") use the station's
+        # local time — effectively ET for all US cities in this bot. We must use
+        # ET-aware dates here, not datetime.now(), because on Railway (UTC clock)
+        # datetime.now() returns UTC time. After 7 PM ET, that would be tomorrow's
+        # UTC date, causing today_high/today_low to be None and today's markets
+        # to be silently skipped. Consistent with how analyze_gaps() does it.
+        et_now   = datetime.now(tz=ZoneInfo("America/New_York"))
+        today    = et_now.strftime("%Y-%m-%d")
+        tomorrow = (et_now + timedelta(days=1)).strftime("%Y-%m-%d")
 
         result = {
             "today_high":         forecasts.get(today,    {}).get("high"),
@@ -1228,6 +1235,12 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
 
     results = []
 
+    # Current LST hour for this city — used in the time-decay logic below.
+    # LST (Local Standard Time) never changes for DST because Kalshi's resolution
+    # windows are defined in fixed LST, not civil time.
+    now_utc  = datetime.utcnow()
+    lst_hour = (now_utc + timedelta(hours=CITIES[city_key]["lst_utc_offset"])).hour
+
     for market in kalshi_markets:
         # --- Step 1: Determine which date this market resolves on ---
         # event_ticker is like "KXHIGHNY-26FEB18"; the date is the last "-" segment
@@ -1320,6 +1333,40 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
                 elif spread > 3:
                     std_dev = 4.0   # models diverge — wide curve, low confidence
 
+        # --- Step 3b: Time-decay adjustment for today's markets ---
+        # As the day progresses, uncertainty about the final high or low shrinks
+        # dramatically — the running observation is a far stronger signal than a
+        # morning forecast. We tighten std_dev only when:
+        #   (a) this is a today market, AND
+        #   (b) we have actual observations (running high/low is not None).
+        # Tomorrow's markets are never adjusted here.
+        # Floor of 1.0 prevents std_dev from collapsing to near-zero.
+        time_decay_multiplier = 1.0   # default: no decay applied
+
+        if date_label == "today" and market["series_type"] == "HIGH" and observed_running is not None:
+            # Daily highs typically occur between 10 AM and 5 PM LST.
+            # Once past solar noon the high has very likely already occurred.
+            if lst_hour >= 17:
+                time_decay_multiplier = 0.3    # after 5 PM: high almost certainly done
+            elif lst_hour >= 14:
+                time_decay_multiplier = 0.5    # 2–5 PM: high very likely occurred
+            elif lst_hour >= 10:
+                time_decay_multiplier = 0.75   # 10 AM–2 PM: high is forming now
+            # Before 10 AM: no adjustment — full uncertainty remains
+            std_dev = max(std_dev * time_decay_multiplier, 1.0)
+
+        elif date_label == "today" and market["series_type"] == "LOW" and observed_running is not None:
+            # Overnight lows typically occur near sunrise (5–7 AM LST).
+            # By mid-morning the low for the day has almost certainly passed.
+            if lst_hour >= 12:
+                time_decay_multiplier = 0.3    # after noon: definitely done, temp is rising
+            elif lst_hour >= 8:
+                time_decay_multiplier = 0.5    # 8 AM–noon: low very likely passed
+            elif lst_hour >= 4:
+                time_decay_multiplier = 0.75   # 4–8 AM: low is forming near sunrise
+            # Before 4 AM: no adjustment — overnight low hasn't occurred yet
+            std_dev = max(std_dev * time_decay_multiplier, 1.0)
+
         # --- Step 4: Calculate Gaussian-implied probability for this bucket ---
         nws_prob_raw = calculate_gaussian_probability(
             forecast_temp,
@@ -1361,7 +1408,8 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
             "edge":          edge,
             "confidence":    confidence,
             "was_settled":      was_settled,
-            "std_dev_used":     std_dev,
+            "std_dev_used":          std_dev,
+            "time_decay_multiplier": time_decay_multiplier,
             "nws_grid_forecast": nws_grid_forecast,  # raw NWS grid temp (never observed)
             "observed_running":  observed_running,    # live obs if used, else None
         })
@@ -1618,14 +1666,13 @@ def log_to_csv(all_results, all_forecasts):
       weatherapi_high     — WeatherAPI.com forecast temp for this period (°F)
       consensus_high      — average of all available model temps (rounded, °F)
       model_spread        — max − min across all available models (°F); high = stay out
-      std_dev_used        — Gaussian std_dev used for nws_implied (2.0/2.5/4.0)
+      std_dev_used        — Gaussian std_dev used for nws_implied (after all adjustments)
+      time_decay_multiplier — multiplier applied to std_dev for today's markets as the day
+                              progresses (1.0 = no decay; 0.75/0.5/0.3 = tightening).
+                              Only set for today markets with live observations; always
+                              1.0 for tomorrow markets and today markets without obs.
       ticker              — Kalshi market ticker (used by resolve.py for result lookup)
       market_date         — "today" or "tomorrow" from the signal's perspective
-
-    SCHEMA CHANGE (replaces old single "nws_forecast" column with three columns):
-      nws_grid_forecast / observed_running / forecast_temp_used
-    If log.csv exists with the OLD schema (has "nws_forecast" header), delete it
-    and restart — the bot will recreate it with the new 21-column header.
     """
     FIELDNAMES = [
         "timestamp", "city", "market_type", "bucket_label",
@@ -1633,7 +1680,7 @@ def log_to_csv(all_results, all_forecasts):
         "confidence", "was_settled",
         "nws_grid_forecast", "observed_running", "forecast_temp_used",
         "ecmwf_high", "gfs_high", "weatherapi_high",
-        "consensus_high", "model_spread", "std_dev_used",
+        "consensus_high", "model_spread", "std_dev_used", "time_decay_multiplier",
         "ticker", "market_date",
     ]
 
@@ -1719,7 +1766,8 @@ def log_to_csv(all_results, all_forecasts):
                         "weatherapi_high":    wapi_temp  if wapi_temp  is not None else "",
                         "consensus_high":     consensus  if consensus  is not None else "",
                         "model_spread":       spread     if spread     is not None else "",
-                        "std_dev_used":       g.get("std_dev_used", ""),
+                        "std_dev_used":          g.get("std_dev_used", ""),
+                        "time_decay_multiplier": g.get("time_decay_multiplier", 1.0),
                         "ticker":             g["ticker"],
                         "market_date":        g["market_date"],
                     })
