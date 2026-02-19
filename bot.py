@@ -951,6 +951,7 @@ def _get_model_data(city_key, g, all_forecasts):
 
     all_temps = [t for t in [nws_temp, ecmwf_temp, gfs_temp, wapi_temp] if t is not None]
     spread    = (max(all_temps) - min(all_temps)) if len(all_temps) >= 2 else None
+    consensus = round(sum(all_temps) / len(all_temps)) if all_temps else None
 
     if spread is not None:
         parts.append(f"Spread: {spread}°")
@@ -963,6 +964,7 @@ def _get_model_data(city_key, g, all_forecasts):
         "gfs_temp":        gfs_temp,
         "wapi_temp":       wapi_temp,
         "spread":          spread,
+        "consensus":       consensus,
         "models_line":     models_line,
         "has_enough_data": has_enough_data,
     }
@@ -1050,9 +1052,11 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
 
     Returns a list sorted by absolute gap size (largest gaps first).
     """
-    city = CITIES[city_key]
-
-    today    = datetime.now().date()
+    # Use ET dates, not UTC. On Railway the system clock is UTC, so at 11 PM ET
+    # datetime.now().date() returns tomorrow's UTC date — all "tomorrow" markets
+    # would be mis-labelled as "unknown date" and silently dropped.
+    et_now   = datetime.now(tz=ZoneInfo("America/New_York"))
+    today    = et_now.date()
     tomorrow = today + timedelta(days=1)
 
     results = []
@@ -1180,6 +1184,59 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
 # it via Twilio SMS and/or Gmail email.
 # ============================================================
 
+def _apply_email_filters(g, md):
+    """
+    Returns True if a market passes ALL four email quality gates.
+    All conditions must be satisfied — any single failure excludes the market.
+
+    Rule 1 — Exclude settled: Kalshi price must be 10–90 (inclusive).
+              Prices outside this range mean the market has effectively
+              resolved and there's no meaningful edge to evaluate.
+
+    Rule 2 — Require an edge: |gap| ≥ 15%.
+              A gap smaller than 15pp isn't worth acting on after fees.
+
+    Rule 3 — Exclude high uncertainty: model spread < 4°F.
+              When models disagree by ≥4° there's no reliable signal.
+
+    Rule 4 — Exclude impossible outcomes: consensus within 5°F of bucket.
+              If all models agree the temp is 10° below a FLOOR boundary,
+              the YES outcome is essentially impossible and the market
+              is already mispriced for structural reasons, not an edge.
+    """
+    # Rule 1: not settled
+    if g["was_settled"]:
+        return False
+
+    # Rule 2: meaningful edge
+    if abs(g["gap"]) < 15:
+        return False
+
+    # Rule 3: models must broadly agree
+    if md["spread"] is not None and md["spread"] >= 4:
+        return False
+
+    # Rule 4: consensus within 5°F of bucket boundaries
+    # (i.e., don't show markets where the outcome is obviously predetermined)
+    if md["consensus"] is not None:
+        c  = md["consensus"]
+        bt = g["bucket_type"]
+        fl = g["floor"]
+        cp = g["cap"]
+
+        if bt == "FLOOR" and fl is not None and c < fl - 5:
+            return False   # consensus is far below floor — clearly NO
+        if bt == "CAP"   and cp is not None and c > cp + 5:
+            return False   # consensus is far above cap — clearly NO
+        if bt == "RANGE":
+            if fl is not None and c < fl - 5:
+                return False   # consensus far below range
+            if cp is not None and c > cp + 5:
+                return False   # consensus far above range
+
+    return True
+
+
 def format_alert_message(all_results, all_forecasts):
     """
     Formats all markets into a plain-text email using model temperature cards.
@@ -1194,14 +1251,15 @@ def format_alert_message(all_results, all_forecasts):
     Sort: Tier 1 cities first, then all others — each group sorted by Kalshi
     price ascending (lowest price = most potentially underpriced).
     """
-    now           = datetime.now()
-    today_date    = now.strftime("%b %d")
-    tomorrow_date = (now + timedelta(days=1)).strftime("%b %d")
-    time_str      = now.strftime("%I:%M %p").lstrip("0")
+    # Use ET time for date display — avoids UTC-vs-ET mismatch on Railway
+    et_now        = _et_now()
+    today_date    = et_now.strftime("%b %d")
+    tomorrow_date = (et_now + timedelta(days=1)).strftime("%b %d")
+    time_str      = et_now.strftime("%I:%M %p").lstrip("0")
     DIVIDER       = "————————————————"
 
     def build_market_list(date_filter):
-        """Builds and sorts the filtered market list for one date period."""
+        """Builds, filters, and sorts the market list for one date period."""
         markets = []
         for city_key, gaps in all_results.items():
             city_name = CITIES[city_key]["name"]
@@ -1211,9 +1269,11 @@ def format_alert_message(all_results, all_forecasts):
                 md = _get_model_data(city_key, g, all_forecasts)
                 if not md["has_enough_data"]:
                     continue
+                if not _apply_email_filters(g, md):
+                    continue
                 markets.append({**g, "city_name": city_name, "city_key": city_key, **md})
-        # Tier 1 first, then by Kalshi price ascending within each tier group
-        markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, x["kalshi_prob"]))
+        # Tier 1 first, then by gap size descending (highest-conviction first)
+        markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, -abs(x["gap"])))
         return markets
 
     def render_markets(market_list):
@@ -1460,13 +1520,13 @@ def _et_now():
 def format_evening_summary(all_results, all_forecasts):
     """
     8 PM evening summary email body.
-    Shows tomorrow's markets (same card format as morning briefing)
-    plus today's observed running highs.
+    Shows tomorrow's high-conviction markets — same filters as morning briefing.
+    Observed highs section removed (noisy, not actionable at end of day).
     """
-    now           = _et_now()
-    today_date    = now.strftime("%b %d")
-    tomorrow_date = (now + timedelta(days=1)).strftime("%b %d")
-    time_str      = now.strftime("%I:%M %p").lstrip("0")
+    et_now        = _et_now()
+    today_date    = et_now.strftime("%b %d")
+    tomorrow_date = (et_now + timedelta(days=1)).strftime("%b %d")
+    time_str      = et_now.strftime("%I:%M %p").lstrip("0")
     DIVIDER       = "————————————————"
 
     # Tomorrow markets — same filter and sort as morning briefing
@@ -1479,9 +1539,12 @@ def format_evening_summary(all_results, all_forecasts):
             md = _get_model_data(city_key, g, all_forecasts)
             if not md["has_enough_data"]:
                 continue
+            if not _apply_email_filters(g, md):
+                continue
             tomorrow_markets.append({**g, "city_name": city_name, "city_key": city_key, **md})
 
-    tomorrow_markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, x["kalshi_prob"]))
+    # Tier 1 first, then by gap size descending (highest-conviction first)
+    tomorrow_markets.sort(key=lambda x: (0 if x["city_key"] in TIER1_CITIES else 1, -abs(x["gap"])))
 
     lines = [
         f"🌙 Kalshi Evening Summary · {today_date} · {time_str}",
@@ -1498,31 +1561,9 @@ def format_evening_summary(all_results, all_forecasts):
             lines.append(g["models_line"] + spread_tag)
             lines.append(DIVIDER)
     else:
-        lines.append("No markets with sufficient model data for tomorrow.")
+        lines.append("No high-conviction markets pass all filters for tomorrow.")
         lines.append("")
 
-    # Today's observed running highs — Tier 1 first, then other cities
-    lines.append("——— TODAY'S OBSERVED HIGHS ———")
-    lines.append("")
-
-    tier1_keys = [k for k in all_results if k in TIER1_CITIES]
-    other_keys = [k for k in all_results if k not in TIER1_CITIES]
-    for city_key in tier1_keys + other_keys:
-        city_name = CITIES[city_key]["name"]
-        for g in all_results[city_key]:
-            if g["market_date"] != "today" or g["series_type"] != "HIGH":
-                continue
-            ft = g.get("forecast_temp")
-            pm = g.get("probable_max")
-            if ft is None:
-                continue
-            if pm and pm != ft:
-                lines.append(f"· {city_name}: {ft}–{pm}°F")
-            else:
-                lines.append(f"· {city_name}: {ft}°F")
-            break  # one HIGH entry per city is enough
-
-    lines.append("")
     lines.append("──────────────────────")
     lines.append("Not financial advice.")
 
