@@ -22,6 +22,7 @@ market data is publicly readable without an API key).
 
 import os
 import csv
+import math
 import time
 import logging
 import schedule
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import requests
+from bot import CITIES
 
 # ============================================================
 # SECTION 1 — SETUP
@@ -59,6 +61,7 @@ RESOLVE_FIELDNAMES = [
     "date", "city", "market_type", "bucket_label", "ticker",
     "direction", "kalshi_price", "nws_implied", "gap",
     "result", "resolved_correct", "pnl_cents",
+    "actual_temp", "forecast_error",
 ]
 
 
@@ -107,6 +110,101 @@ def fetch_market_result(ticker):
     except Exception as e:
         log.error(f"  {ticker}: unexpected error — {e}")
         return None, False
+
+
+# ============================================================
+# SECTION 2.5 — FETCH ACTUAL TEMPERATURE FROM NWS OBSERVATIONS
+# ============================================================
+
+def fetch_actual_temperature(station, date, station_type, lst_utc_offset):
+    """
+    Fetches the actual daily HIGH and LOW temperature from NWS observations
+    for the given station and calendar date.
+
+    The NWS observations endpoint is scoped to the station's midnight-to-midnight
+    window in LST (Local Standard Time), converted to UTC via lst_utc_offset.
+
+      station        — NWS ICAO station code (e.g. "KNYC")
+      date           — datetime.date for the resolution day
+      station_type   — "5-minute" (ASOS) or "hourly" (cooperative/manual observer)
+      lst_utc_offset — int, e.g. -5 for EST. Negative because LST is behind UTC.
+
+    Temperature conversion:
+      ASOS (5-minute) : official_F = math.floor(celsius * 9/5 + 32)
+      Hourly (manual) : official_F = round(celsius * 9/5 + 32)
+
+    The maxTemperatureLast24Hours (DSM) field, if present on any observation,
+    overrides the running computed high if it is higher.
+
+    Returns {"actual_high": int, "actual_low": int} or None on failure.
+    """
+    try:
+        # Convert the target date's midnight LST to UTC.
+        # lst_utc_offset is negative (e.g. -5), so -lst_utc_offset gives the positive
+        # hour offset: midnight LST + 5 h = 05:00 UTC for EST.
+        utc_hour  = -lst_utc_offset
+        start_utc = datetime(date.year, date.month, date.day, utc_hour, 0, 0)
+        end_utc   = start_utc + timedelta(days=1)
+
+        start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        response = requests.get(
+            f"https://api.weather.gov/stations/{station}/observations",
+            params={"start": start_str, "end": end_str, "limit": 500},
+            headers={"User-Agent": "KalshiClimateBot/1.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+
+        features = response.json().get("features", [])
+
+        if not features:
+            log.warning(f"  {station}: no observations returned for {date}")
+            return None
+
+        actual_high = None
+        actual_low  = None
+
+        for obs in features:
+            props  = obs.get("properties", {})
+
+            # Current temperature reading from this observation
+            temp_c = (props.get("temperature") or {}).get("value")
+            if temp_c is not None:
+                if station_type == "5-minute":
+                    temp_f = math.floor(temp_c * 9 / 5 + 32)
+                else:   # hourly / cooperative observer
+                    temp_f = round(temp_c * 9 / 5 + 32)
+
+                if actual_high is None or temp_f > actual_high:
+                    actual_high = temp_f
+                if actual_low is None or temp_f < actual_low:
+                    actual_low = temp_f
+
+            # DSM (Daily Summary Message) field — overrides computed high if higher.
+            # Use the same rounding rule as the station type.
+            max_24h_c = (props.get("maxTemperatureLast24Hours") or {}).get("value")
+            if max_24h_c is not None:
+                if station_type == "5-minute":
+                    max_24h_f = math.floor(max_24h_c * 9 / 5 + 32)
+                else:
+                    max_24h_f = round(max_24h_c * 9 / 5 + 32)
+                if actual_high is None or max_24h_f > actual_high:
+                    actual_high = max_24h_f
+
+        if actual_high is None and actual_low is None:
+            log.warning(f"  {station}: no valid temperature readings for {date}")
+            return None
+
+        return {"actual_high": actual_high, "actual_low": actual_low}
+
+    except requests.exceptions.RequestException as e:
+        log.error(f"  {station}: NWS observations request failed — {e}")
+        return None
+    except Exception as e:
+        log.error(f"  {station}: unexpected error in fetch_actual_temperature — {e}")
+        return None
 
 
 # ============================================================
@@ -275,6 +373,26 @@ def print_summary(date_str, rows):
         low_str   = pnl_str([r for r in city_rows if r["market_type"] == "LOW"])
         print(f"  {city:<22}  {high_str:>10}  {low_str:>8}")
 
+    # ── NWS forecast accuracy (MAE by city) ─────────────────────────────────
+    # Only rows where we successfully fetched the actual observed temperature
+    # contribute. forecast_error = NWS forecast − actual (in °F); we report MAE.
+    mae_rows = [r for r in rows if r.get("forecast_error", "") != ""]
+    if mae_rows:
+        print()
+        print(f"  NWS FORECAST ERROR (mean absolute error vs observed)")
+        print(f"  {'-' * 46}")
+        for city in sorted({r["city"] for r in mae_rows}):
+            city_subset = [r for r in mae_rows if r["city"] == city]
+            errors = []
+            for r in city_subset:
+                try:
+                    errors.append(abs(float(r["forecast_error"])))
+                except (ValueError, TypeError):
+                    pass
+            if errors:
+                mae = sum(errors) / len(errors)
+                print(f"  {city:<22}  Avg Error: {mae:.1f}°F")
+
     print(f"{DIVIDER}\n")
 
 
@@ -288,8 +406,9 @@ def run_resolution_check():
       1. Load yesterday's HIGH-confidence signals from log.csv
       2. Fetch each market's result from the Kalshi API
       3. Determine correctness (our signal direction vs actual resolution)
-      4. Append results to resolve_log.csv
-      5. Print the accuracy summary
+      4. Fetch the actual observed temperature from NWS observations
+      5. Append results to resolve_log.csv
+      6. Print the PnL + forecast accuracy summary
     """
     global _RAN_FOR_DATE
 
@@ -310,6 +429,17 @@ def run_resolution_check():
         return
 
     log.info(f"Checking {len(signals)} unique markets for {yesterday_str}...")
+
+    # Build a reverse lookup: display name → city_key (e.g. "New York City" → "NYC")
+    name_to_key = {v["name"]: k for k, v in CITIES.items()}
+
+    # Parse the resolution date once — used for NWS observation lookups below
+    resolve_date_obj = datetime.strptime(yesterday_str, "%Y-%m-%d").date()
+
+    # Cache NWS actual temps by city_key so we only hit the API once per city,
+    # not once per ticker (a city can have many buckets in signals).
+    # Value is {"actual_high": int, "actual_low": int} or None if fetch failed.
+    actuals_cache = {}
 
     resolved_rows = []
 
@@ -356,6 +486,45 @@ def run_resolution_check():
             f"pnl={pnl_sign}{pnl:.0f}¢"
         )
 
+        # ── Fetch actual temperature from NWS ─────────────────────────────
+        city_key  = name_to_key.get(row["city"])
+        city_conf = CITIES.get(city_key) if city_key else None
+
+        actual_temp    = ""
+        forecast_error = ""
+
+        if city_conf:
+            # Fetch once per city; reuse the cached result for subsequent tickers
+            if city_key not in actuals_cache:
+                log.info(f"  Fetching NWS actuals for {row['city']} ({city_conf['nws_station']})...")
+                actuals_cache[city_key] = fetch_actual_temperature(
+                    city_conf["nws_station"],
+                    resolve_date_obj,
+                    city_conf["station_type"],
+                    city_conf["lst_utc_offset"],
+                )
+                time.sleep(0.15)   # be polite to the NWS API
+
+            actuals = actuals_cache[city_key]
+            if actuals:
+                actual_temp = (
+                    actuals["actual_high"] if row["market_type"] == "HIGH"
+                    else actuals["actual_low"]
+                )
+
+                # forecast_error = NWS forecasted temp − actual observed temp (degrees F).
+                # "nws_forecast" in log.csv is the raw temperature value, NOT nws_implied
+                # (which is a percentage). Only compute when both values are present.
+                nws_fc_str = row.get("nws_forecast", "")
+                if nws_fc_str != "" and actual_temp != "":
+                    try:
+                        forecast_error = round(float(nws_fc_str) - actual_temp, 1)
+                    except (ValueError, TypeError):
+                        forecast_error = ""
+        else:
+            if row["city"]:
+                log.warning(f"  {ticker}: city '{row['city']}' not found in CITIES config")
+
         resolved_rows.append({
             "date":             yesterday_str,
             "city":             row["city"],
@@ -369,6 +538,8 @@ def run_resolution_check():
             "result":           result,
             "resolved_correct": correct,
             "pnl_cents":        pnl,
+            "actual_temp":      actual_temp,
+            "forecast_error":   forecast_error,
         })
 
     write_resolve_log(resolved_rows)
