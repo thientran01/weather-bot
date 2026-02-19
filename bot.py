@@ -2223,32 +2223,39 @@ def reset_daily_state():
 # ============================================================
 
 LOG_PATH = os.getenv("LOG_PATH", "log.csv")
+RESOLVE_LOG = os.getenv("RESOLVE_LOG_PATH", "resolve_log.csv")
 
 
 class ExportHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler — only serves log.csv as a download."""
+    """Minimal HTTP handler — serves log.csv and resolve_log.csv as downloads."""
 
     def do_GET(self):
-        # Accept both / and /export so Railway health checks don't 404
-        if self.path not in ("/", "/export"):
+        # Route the request to the correct file based on the path
+        if self.path in ("/", "/export"):
+            file_path = LOG_PATH
+            filename = "log.csv"
+        elif self.path == "/resolve":
+            file_path = RESOLVE_LOG
+            filename = "resolve_log.csv"
+        else:
             self.send_response(404)
             self.end_headers()
             return
 
-        if not os.path.isfile(LOG_PATH):
+        if not os.path.isfile(file_path):
             # No data yet — return an empty 200 so callers don't crash
             self.send_response(200)
             self.send_header("Content-Type", "text/csv")
-            self.send_header("Content-Disposition", 'attachment; filename="log.csv"')
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
             return
 
         try:
-            with open(LOG_PATH, "rb") as f:
+            with open(file_path, "rb") as f:
                 data = f.read()
             self.send_response(200)
             self.send_header("Content-Type", "text/csv")
-            self.send_header("Content-Disposition", 'attachment; filename="log.csv"')
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
