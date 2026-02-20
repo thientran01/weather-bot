@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import requests
-from bot import CITIES
+from config import CITIES
 
 # ============================================================
 # SECTION 1 — SETUP
