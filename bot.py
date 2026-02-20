@@ -999,23 +999,19 @@ def _fetch_openmeteo_model(city_key, model):
         highs = data["daily"]["temperature_2m_max"]
         lows  = data["daily"]["temperature_2m_min"]
 
-        # Use UTC date — Open-Meteo starts its daily forecast from the UTC current
-        # date, so matching against local time would miss "today" after 7 PM ET
-        # (when UTC has already rolled to the next day).
-        today    = datetime.utcnow().strftime("%Y-%m-%d")
-        tomorrow = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
-
+        # Take the first date as "today" and the second as "tomorrow".
+        # Open-Meteo uses timezone=auto (station's local time), so its day
+        # boundaries always match the station's local date — no UTC offset
+        # arithmetic needed, and no risk of a None result after 7 PM ET.
         result = {"today_high": None, "today_low": None, "tomorrow_high": None, "tomorrow_low": None}
 
-        for i, date_str in enumerate(times):
-            high = round(highs[i]) if highs[i] is not None else None
-            low  = round(lows[i])  if lows[i]  is not None else None
-            if date_str == today:
-                result["today_high"] = high
-                result["today_low"]  = low
-            elif date_str == tomorrow:
-                result["tomorrow_high"] = high
-                result["tomorrow_low"]  = low
+        if len(times) >= 1:
+            result["today_high"] = round(highs[0]) if highs[0] is not None else None
+            result["today_low"]  = round(lows[0])  if lows[0]  is not None else None
+
+        if len(times) >= 2:
+            result["tomorrow_high"] = round(highs[1]) if highs[1] is not None else None
+            result["tomorrow_low"]  = round(lows[1])  if lows[1]  is not None else None
 
         log.info(
             f"[{city_key}] Open-Meteo ({model}): "
@@ -2373,7 +2369,7 @@ def run_cycle():
             # ── Intraday: spread convergence alert ──────────────────────────
             # Fires when a previously high-spread (≥3°F) market's models
             # converge to <1°F spread — signalling a newly reliable setup.
-            now     = datetime.now()
+            now     = _et_now()
             DIVIDER = "————————————————"
             body_lines = [
                 f"⚡ SPREAD ALERT · {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
