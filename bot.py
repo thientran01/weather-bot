@@ -25,7 +25,7 @@ from models import (
     fetch_ecmwf_forecast, fetch_gfs_forecast, fetch_gem_forecast,
     fetch_icon_forecast, fetch_hourly_forecast, fetch_weatherapi_forecast,
 )
-from analysis import _get_model_data, analyze_gaps
+from analysis import analyze_gaps
 from alerts import (
     format_alert_message, format_evening_summary,
     send_email, send_test_email,
@@ -41,12 +41,6 @@ from resolve import run_resolution
 # MODULE-LEVEL STATE
 # These sets and dates reset at midnight and track intraday events.
 # ============================================================
-
-# Tracks markets whose model spread was ≥ 3°F in any cycle today.
-# When a flagged market's spread later drops below 1°F, an intraday alert fires.
-# Both sets reset at midnight UTC so each day starts fresh.
-_HIGH_SPREAD_FLAGGED = set()   # tickers that have seen spread ≥ 3°F today
-_SPREAD_ALERTED      = set()   # tickers that already got a convergence alert today
 
 # ET date on which the morning briefing / evening summary was last sent.
 # Prevents duplicate sends when the bot cycles through the 7:00–7:15 AM or
@@ -88,7 +82,7 @@ def run_cycle():
 
     If a city fails at any step it is skipped; all other cities continue.
     """
-    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED, _RESOLVE_RAN_TODAY, _RESOLVE_DATE
+    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _RESOLVE_RAN_TODAY, _RESOLVE_DATE
 
     cycle_start   = time.time()
     all_results   = {}
@@ -161,28 +155,11 @@ def run_cycle():
             log.error(f"[{city_key}] Unexpected error — city skipped. ({e})")
             cities_failed += 1
 
-    # ── Spread tracking + email decision ────────────────────────────────────
+    # ── Email decision ───────────────────────────────────────────────────────
     if all_results:
         et      = _et_now()
         et_date = et.date()
         et_min  = et.hour * 60 + et.minute   # minutes since midnight ET
-
-        # Update _HIGH_SPREAD_FLAGGED and find any markets whose spread just
-        # converged below 1°F (previously had spread ≥ 3°F = "stay out" signal).
-        converged_markets = []
-        for city_key, gaps in all_results.items():
-            for g in gaps:
-                md = _get_model_data(city_key, g, all_forecasts)
-                if not md["has_enough_data"] or md["spread"] is None:
-                    continue
-                ticker = g["ticker"]
-                if md["spread"] >= 3:
-                    _HIGH_SPREAD_FLAGGED.add(ticker)
-                elif md["spread"] < 1 and ticker in _HIGH_SPREAD_FLAGGED and ticker not in _SPREAD_ALERTED:
-                    converged_markets.append({
-                        **g, "city_name": CITIES[city_key]["name"], "city_key": city_key, **md,
-                    })
-                    _SPREAD_ALERTED.add(ticker)
 
         if 420 <= et_min < 435 and _MORNING_SENT_DATE != et_date:
             # ── 7:00–7:14 AM ET: morning briefing ──────────────────────────
@@ -203,30 +180,6 @@ def run_cycle():
             )
             _EVENING_SENT_DATE = et_date
             log.info("Evening summary sent.")
-
-        elif converged_markets:
-            # ── Intraday: spread convergence alert ──────────────────────────
-            # Fires when a previously high-spread (≥3°F) market's models
-            # converge to <1°F spread — signalling a newly reliable setup.
-            now     = _et_now()
-            DIVIDER = "————————————————"
-            body_lines = [
-                f"⚡ SPREAD ALERT · {now.strftime('%b %d')} {now.strftime('%I:%M %p').lstrip('0')}",
-                "",
-                "Model spread has converged on:",
-                "",
-            ]
-            for g in converged_markets:
-                body_lines.append(f"📍 {g['city_name'].upper()} — {g['series_type']} {g['bucket_label']}")
-                body_lines.append(f"Kalshi: {g['kalshi_prob']}%")
-                body_lines.append(g["models_line"])
-                body_lines.append(DIVIDER)
-            body_lines.extend(["", "Check Kalshi for these markets.", "Not financial advice."])
-            send_email(
-                "\n".join(body_lines),
-                subject=f"⚡ Spread Convergence Alert — {now.strftime('%b %d')}",
-            )
-            log.info(f"Spread convergence alert sent ({len(converged_markets)} market(s)).")
 
         else:
             # ── Daytime: silent cycle ────────────────────────────────────────
@@ -289,12 +242,10 @@ def run_cycle():
 
 def reset_daily_state():
     """
-    Clears spread-tracking state at midnight UTC so each day starts fresh.
+    Resets daily state at midnight UTC so each day starts fresh.
     Called by the scheduler at 00:00 UTC.
     """
-    _HIGH_SPREAD_FLAGGED.clear()
-    _SPREAD_ALERTED.clear()
-    log.info("Daily spread-tracking state reset at midnight UTC.")
+    log.info("Daily state reset at midnight UTC.")
     reset_paper_trading()
 
 
@@ -328,7 +279,6 @@ if __name__ == "__main__":
     log.info(f"  Market cycle every {RUN_EVERY_MINUTES} min")
     log.info( "  Email schedule (America/New_York):")
     log.info( "    ☀️  7:00 AM — morning briefing (all markets, model cards)")
-    log.info( "    ⚡  Intraday — spread convergence alert (when ≥3° spread drops to <1°)")
     log.info( "    🌙  8:00 PM — evening summary (tomorrow markets + today's highs)")
     log.info( "  Daily state reset at midnight UTC")
     log.info( "  Export server: GET /export → log.csv")
