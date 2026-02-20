@@ -208,6 +208,40 @@ def fetch_actual_temperature(station, date, station_type, lst_utc_offset):
 
 
 # ============================================================
+# SECTION 2.8 — LOOK UP FORECAST TEMP FROM LOG.CSV
+# ============================================================
+
+def _get_forecast_for_ticker(ticker, log_path):
+    """
+    Scans log.csv for all rows matching this ticker and returns the
+    forecast_temp_used value from the last (most recent) matching row.
+
+    forecast_temp_used is the temperature that drove the Gaussian probability
+    calculation — it's either the live observed running high/low (for today
+    markets with observations) or the NWS grid forecast (for tomorrow markets
+    or early-morning today markets with no observations yet).
+
+    Returns an int (°F) if found, or None if the ticker has no logged rows
+    with a non-empty forecast_temp_used.
+    """
+    if not os.path.isfile(log_path):
+        return None
+
+    forecast_temp = None
+    try:
+        with open(log_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("ticker") == ticker and row.get("forecast_temp_used", "").strip():
+                    forecast_temp = row["forecast_temp_used"]
+        # Returns the last match — most recent cycle logged for this ticker
+        return int(float(forecast_temp)) if forecast_temp else None
+    except Exception as e:
+        log.warning(f"  _get_forecast_for_ticker({ticker}): {e}")
+        return None
+
+
+# ============================================================
 # SECTION 3 — LOAD YESTERDAY'S SIGNALS FROM LOG.CSV
 # ============================================================
 
@@ -512,15 +546,15 @@ def run_resolution_check():
                     else actuals["actual_low"]
                 )
 
-                # forecast_error = NWS forecasted temp − actual observed temp (degrees F).
-                # "nws_forecast" in log.csv is the raw temperature value, NOT nws_implied
-                # (which is a percentage). Only compute when both values are present.
-                nws_fc_str = row.get("nws_forecast", "")
-                if nws_fc_str != "" and actual_temp != "":
-                    try:
-                        forecast_error = round(float(nws_fc_str) - actual_temp, 1)
-                    except (ValueError, TypeError):
-                        forecast_error = ""
+                # forecast_error = forecast_temp_used − actual observed temp (°F).
+                # Positive = model predicted too high; negative = too low.
+                # Look up from log.csv via the helper so we always get the correct
+                # column name (forecast_temp_used) regardless of CSV schema history.
+                forecast_temp = _get_forecast_for_ticker(ticker, LOG_FILE)
+                if forecast_temp is not None and actual_temp != "":
+                    forecast_error = round(forecast_temp - actual_temp, 1)
+                else:
+                    forecast_error = ""
         else:
             if row["city"]:
                 log.warning(f"  {ticker}: city '{row['city']}' not found in CITIES config")
