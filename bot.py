@@ -1938,6 +1938,228 @@ def log_to_csv(all_results, all_forecasts):
 
 
 # ============================================================
+# SECTION 8b — PAPER TRADING
+#
+# Simulates trades the bot would have placed if it acted on
+# signals the moment they pass all quality filters.
+#
+# Completely passive — it never touches the Kalshi order API,
+# only the read-only market data endpoint for resolution checks.
+#
+# State is in-memory (_PAPER_POSITIONS dict). If the bot restarts
+# mid-day, open positions are lost. This is acceptable for paper
+# trading — resolved trades are written to paper_trades.csv before
+# any restart could occur, so only still-open positions disappear.
+# ============================================================
+
+PAPER_TRADE_LOG = os.getenv("PAPER_TRADE_LOG_PATH", "paper_trades.csv")
+
+# In-memory position tracker. Only ONE entry per ticker per day.
+# Key: ticker string. Value: dict of entry metadata.
+_PAPER_POSITIONS = {}
+_PAPER_TRADE_DATE = None   # ET date; used to detect day rollover
+
+PAPER_TRADE_FIELDNAMES = [
+    "entry_time", "exit_time", "city", "market_type", "bucket_label", "ticker",
+    "direction", "entry_price", "exit_result", "pnl_cents",
+    "gap_at_entry", "spread_at_entry", "std_dev_at_entry", "time_decay_at_entry",
+    "nws_prob_at_entry", "forecast_temp_at_entry", "consensus_at_entry",
+    "hourly_adjusted_at_entry",
+]
+
+
+def _passes_paper_trade_filters(g, md):
+    """
+    Returns True if a market passes all paper-trading quality gates.
+    Mirrors _apply_email_filters() exactly, but kept as a separate function
+    so the two systems can diverge independently in the future.
+
+    Rule 1 — Exclude settled: Kalshi price must be 10–90 (inclusive).
+    Rule 2 — Require an edge: |gap| >= 15%.
+    Rule 3 — Exclude high uncertainty: model spread < 8°F.
+    Rule 4 — Exclude impossible outcomes: consensus within 5°F of bucket.
+    """
+    # Rule 1: not settled
+    if g["was_settled"]:
+        return False
+
+    # Rule 2: meaningful edge
+    if abs(g["gap"]) < 15:
+        return False
+
+    # Rule 3: models must broadly agree (8°F threshold)
+    if md["spread"] is not None and md["spread"] >= 8:
+        return False
+
+    # Rule 4: consensus within 5°F of bucket boundaries
+    if md["consensus"] is not None:
+        c  = md["consensus"]
+        bt = g["bucket_type"]
+        fl = g["floor"]
+        cp = g["cap"]
+
+        if bt == "FLOOR" and fl is not None and c < fl - 5:
+            return False   # consensus far below floor — clearly NO
+        if bt == "CAP"   and cp is not None and c > cp + 5:
+            return False   # consensus far above cap — clearly NO
+        if bt == "RANGE":
+            if fl is not None and c < fl - 5:
+                return False   # consensus far below range
+            if cp is not None and c > cp + 5:
+                return False   # consensus far above range
+
+    return True
+
+
+def check_paper_entries(all_results, all_forecasts):
+    """
+    Called at the end of every cycle. Scans all today's markets and
+    records a paper trade entry for any that pass quality filters and
+    haven't been entered yet today.
+
+    Only today's markets are traded — tomorrow's markets are skipped
+    because we need live observations to confirm the signal is real.
+    """
+    for city_key, gaps in all_results.items():
+        for g in gaps:
+            # Only paper-trade same-day markets (live observations available)
+            if g["market_date"] != "today":
+                continue
+
+            ticker = g["ticker"]
+
+            # Only enter each market once per day — don't re-enter on every cycle
+            if ticker in _PAPER_POSITIONS:
+                continue
+
+            # Apply quality filters (same rules as email, separate function)
+            md = _get_model_data(city_key, g, all_forecasts)
+            if not md["has_enough_data"]:
+                continue
+            if not _passes_paper_trade_filters(g, md):
+                continue
+
+            # Record the entry in memory
+            _PAPER_POSITIONS[ticker] = {
+                "entry_time":               datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "city":                     CITIES[city_key]["name"],
+                "market_type":              g["series_type"],
+                "bucket_label":             g["bucket_label"],
+                "ticker":                   ticker,
+                "direction":                g["edge"],
+                "entry_price":              g["kalshi_prob"],
+                "gap_at_entry":             g["gap"],
+                "spread_at_entry":          md["spread"],
+                "std_dev_at_entry":         g["std_dev_used"],
+                "time_decay_at_entry":      g.get("time_decay_multiplier", 1.0),
+                "nws_prob_at_entry":        g["nws_prob"],
+                "forecast_temp_at_entry":   g["forecast_temp"],
+                "consensus_at_entry":       md["consensus"],
+                "hourly_adjusted_at_entry": g.get("hourly_adjusted", False),
+            }
+            log.info(
+                f"📝 PAPER TRADE: {g['edge']} {ticker} at {g['kalshi_prob']}¢"
+                f" (gap: {g['gap']:+d}%)"
+            )
+
+
+def resolve_paper_trades():
+    """
+    Checks each open paper position against the Kalshi API to see if
+    the market has resolved. If it has, calculates PnL and writes a row
+    to PAPER_TRADE_LOG, then removes the position from _PAPER_POSITIONS.
+
+    PnL logic (in cents, per 100-cent contract):
+      BUY YES: win = +(100 - entry_price), loss = -entry_price
+      BUY NO:  win = +entry_price,          loss = -(100 - entry_price)
+    """
+    if not _PAPER_POSITIONS:
+        return
+
+    resolved_tickers = []
+
+    for ticker, pos in list(_PAPER_POSITIONS.items()):
+        try:
+            response = requests.get(
+                f"{KALSHI_BASE_URL}/markets/{ticker}",
+                timeout=10,
+            )
+            market = response.json().get("market", response.json())
+            result = market.get("result", "")
+
+            if result not in ("yes", "no"):
+                # Not resolved yet — check again next cycle
+                time.sleep(0.15)
+                continue
+
+            # Calculate PnL in cents
+            entry_price = pos["entry_price"]
+            direction   = pos["direction"]
+            if direction == "BUY YES":
+                pnl = (100 - entry_price) if result == "yes" else -entry_price
+            else:  # BUY NO
+                pnl = entry_price if result == "no" else -(100 - entry_price)
+
+            exit_time  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            file_exists = os.path.isfile(PAPER_TRADE_LOG)
+
+            try:
+                with open(PAPER_TRADE_LOG, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=PAPER_TRADE_FIELDNAMES)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow({
+                        "entry_time":               pos["entry_time"],
+                        "exit_time":                exit_time,
+                        "city":                     pos["city"],
+                        "market_type":              pos["market_type"],
+                        "bucket_label":             pos["bucket_label"],
+                        "ticker":                   ticker,
+                        "direction":                direction,
+                        "entry_price":              entry_price,
+                        "exit_result":              result,
+                        "pnl_cents":                pnl,
+                        "gap_at_entry":             pos["gap_at_entry"],
+                        "spread_at_entry":          pos["spread_at_entry"] if pos["spread_at_entry"] is not None else "",
+                        "std_dev_at_entry":         pos["std_dev_at_entry"],
+                        "time_decay_at_entry":      pos["time_decay_at_entry"],
+                        "nws_prob_at_entry":        pos["nws_prob_at_entry"],
+                        "forecast_temp_at_entry":   pos["forecast_temp_at_entry"] if pos["forecast_temp_at_entry"] is not None else "",
+                        "consensus_at_entry":        pos["consensus_at_entry"] if pos["consensus_at_entry"] is not None else "",
+                        "hourly_adjusted_at_entry": pos["hourly_adjusted_at_entry"],
+                    })
+            except Exception as csv_err:
+                log.error(f"Paper trade CSV write failed for {ticker}: {csv_err}")
+
+            resolved_tickers.append(ticker)
+            log.info(f"📝 PAPER RESOLVED: {ticker} → {result}, PnL: {pnl:+.0f}¢")
+
+        except Exception as exc:
+            log.error(f"resolve_paper_trades: error checking {ticker}: {exc}")
+
+        time.sleep(0.15)   # Be respectful to the Kalshi API
+
+    for ticker in resolved_tickers:
+        del _PAPER_POSITIONS[ticker]
+
+
+def reset_paper_trading():
+    """
+    Called at midnight UTC. Logs a warning for any positions that are
+    still open (voided markets, unresolved edge cases) and clears them.
+    Keeps _PAPER_POSITIONS clean at the start of each new day.
+    """
+    if _PAPER_POSITIONS:
+        tickers = list(_PAPER_POSITIONS.keys())
+        log.warning(
+            f"reset_paper_trading: {len(tickers)} unresolved position(s) cleared "
+            f"at midnight: {tickers}"
+        )
+    _PAPER_POSITIONS.clear()
+    log.info("Paper trading state reset at midnight.")
+
+
+# ============================================================
 # SECTION 9a — EMAIL TIMING & CHANGE DETECTION
 # Helpers that decide whether to send an email this cycle and
 # which format to use (morning briefing / change alert / evening
@@ -2031,7 +2253,7 @@ def run_cycle():
 
     If a city fails at any step it is skipped; all other cities continue.
     """
-    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED
+    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED, _PAPER_TRADE_DATE
 
     cycle_start   = time.time()
     all_results   = {}
@@ -2177,6 +2399,14 @@ def run_cycle():
 
         log_to_csv(all_results, all_forecasts)
 
+        # ── Paper trading ────────────────────────────────────────────────────
+        # Update the date tracker (doesn't clear positions — they resolve naturally)
+        if _PAPER_TRADE_DATE != et.date():
+            _PAPER_TRADE_DATE = et.date()
+
+        check_paper_entries(all_results, all_forecasts)
+        resolve_paper_trades()
+
     else:
         log.warning("No city data collected this cycle — email and CSV skipped.")
 
@@ -2198,6 +2428,8 @@ def run_cycle():
     )
     if cities_failed:
         log.warning(f"{cities_failed} city/cities failed this cycle.")
+    if _PAPER_POSITIONS:
+        log.info(f"📝 Paper positions open: {len(_PAPER_POSITIONS)}")
 
     return all_results, all_forecasts
 
@@ -2210,6 +2442,7 @@ def reset_daily_state():
     _HIGH_SPREAD_FLAGGED.clear()
     _SPREAD_ALERTED.clear()
     log.info("Daily spread-tracking state reset at midnight UTC.")
+    reset_paper_trading()
 
 
 # ============================================================
@@ -2237,6 +2470,9 @@ class ExportHandler(BaseHTTPRequestHandler):
         elif self.path == "/resolve":
             file_path = RESOLVE_LOG
             filename = "resolve_log.csv"
+        elif self.path == "/paper":
+            file_path = PAPER_TRADE_LOG
+            filename = "paper_trades.csv"
         else:
             self.send_response(404)
             self.end_headers()
@@ -2311,6 +2547,7 @@ if __name__ == "__main__":
     log.info( "    🌙  8:00 PM — evening summary (tomorrow markets + today's highs)")
     log.info( "  Daily state reset at midnight UTC")
     log.info( "  Export server: GET /export → log.csv")
+    log.info( "  📝 Paper trading: logging simulated trades to paper_trades.csv")
     if test_mode:
         log.info("  Mode: --test (will exit after first cycle)")
     if SEND_TEST_EMAIL:
