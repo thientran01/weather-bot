@@ -426,7 +426,7 @@ def run_resolution_check():
         print("  No high-confidence signals in log.csv for yesterday.")
         print(f"  (Rows need the 'ticker' column — delete log.csv if it predates this)")
         print(f"{'=' * 52}\n")
-        return
+        return 0
 
     log.info(f"Checking {len(signals)} unique markets for {yesterday_str}...")
 
@@ -544,6 +544,16 @@ def run_resolution_check():
 
     write_resolve_log(resolved_rows)
     print_summary(yesterday_str, resolved_rows)
+    return len(resolved_rows)
+
+
+def run_resolution():
+    """
+    Public entry point for running the daily resolution check.
+    Called by bot.py's run_cycle() at 9:30 AM ET.
+    Returns the number of markets resolved (0 if none found or already run today).
+    """
+    return run_resolution_check()
 
 
 # ============================================================

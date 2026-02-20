@@ -34,6 +34,7 @@ import paper_trading as pt
 from paper_trading import check_paper_entries, resolve_paper_trades, reset_paper_trading
 from logging_csv import log_to_csv
 from export_server import run_http_server
+from resolve import run_resolution
 
 
 # ============================================================
@@ -54,6 +55,11 @@ _SPREAD_ALERTED      = set()   # tickers that already got a convergence alert to
 # guard makes it robust to restarts or clock drift).
 _MORNING_SENT_DATE = None
 _EVENING_SENT_DATE = None
+
+# Guards for the 9:30 AM ET daily resolution check.
+# _RESOLVE_DATE resets the flag each new ET day so it fires exactly once.
+_RESOLVE_RAN_TODAY = False
+_RESOLVE_DATE      = None
 
 
 # ============================================================
@@ -82,7 +88,7 @@ def run_cycle():
 
     If a city fails at any step it is skipped; all other cities continue.
     """
-    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED
+    global _MORNING_SENT_DATE, _EVENING_SENT_DATE, _HIGH_SPREAD_FLAGGED, _SPREAD_ALERTED, _RESOLVE_RAN_TODAY, _RESOLVE_DATE
 
     cycle_start   = time.time()
     all_results   = {}
@@ -235,6 +241,24 @@ def run_cycle():
 
         check_paper_entries(all_results, all_forecasts)
         resolve_paper_trades()
+
+        # ── Daily resolution check (9:30 AM ET) ─────────────────────────────
+        # Reads yesterday's signals from log.csv, fetches actual Kalshi
+        # results and NWS observed temps, then writes to resolve_log.csv.
+        # Fires once per day at or after 9:30 AM ET — late enough for West
+        # Coast markets (LAX, SFO, SEA) to have settled before we check.
+        if _RESOLVE_DATE != et.date():
+            _RESOLVE_DATE = et.date()
+            _RESOLVE_RAN_TODAY = False
+
+        if not _RESOLVE_RAN_TODAY and et.hour >= 9 and et.minute >= 30:
+            try:
+                log.info("🔍 Running daily resolution check...")
+                resolved_count = run_resolution()
+                log.info(f"🔍 Resolution complete: {resolved_count} markets resolved")
+                _RESOLVE_RAN_TODAY = True
+            except Exception as e:
+                log.error(f"Resolution check failed: {e}")
 
     else:
         log.warning("No city data collected this cycle — email and CSV skipped.")
