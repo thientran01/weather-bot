@@ -55,9 +55,11 @@ def check_paper_entries(all_results, all_forecasts):
     """
     for city_key, gaps in all_results.items():
         for g in gaps:
-            # Only paper-trade same-day markets (live observations available)
-            if g["market_date"] != "today":
-                continue
+            # Trade both today and tomorrow markets.
+            # Tomorrow markets are entered at whatever price is current when the
+            # signal first passes filters — this captures the actual entry timing
+            # that a real trader would experience, unlike resolve.py which uses
+            # end-of-day snapshots.
 
             ticker = g["ticker"]
 
@@ -178,15 +180,14 @@ def resolve_paper_trades():
 
 def reset_paper_trading():
     """
-    Called at midnight UTC. Logs a warning for any positions that are
-    still open (voided markets, unresolved edge cases) and clears them.
-    Keeps _PAPER_POSITIONS clean at the start of each new day.
+    Called at midnight UTC. Logs how many positions are still open.
+    Does NOT clear positions — tomorrow market entries need to survive
+    overnight to resolve the next day.
     """
     if _PAPER_POSITIONS:
-        tickers = list(_PAPER_POSITIONS.keys())
-        log.warning(
-            f"reset_paper_trading: {len(tickers)} unresolved position(s) cleared "
-            f"at midnight: {tickers}"
+        log.info(
+            f"reset_paper_trading: {len(_PAPER_POSITIONS)} position(s) still open "
+            f"at midnight (will resolve naturally): {list(_PAPER_POSITIONS.keys())}"
         )
-    _PAPER_POSITIONS.clear()
-    log.info("Paper trading state reset at midnight.")
+    else:
+        log.info("Paper trading: no open positions at midnight.")

@@ -321,8 +321,15 @@ def analyze_gaps(city_key, kalshi_markets, nws_forecast, city_forecasts=None):
         elif date_label == "today" and market["series_type"] == "LOW" and observed_running is not None:
             # Overnight lows typically occur near sunrise (5–7 AM LST).
             # By mid-morning the low for the day has almost certainly passed.
-            if lst_hour >= 12:
-                time_decay_multiplier = 0.3    # after noon: definitely done, temp is rising
+            # BUT: after ~6 PM, temps are falling again toward tomorrow's overnight
+            # low, so the "today" low reading is still in flux if the market
+            # covers the full calendar day (midnight to midnight).
+            if lst_hour >= 18:
+                # Evening/night: temp is dropping, overnight low hasn't occurred yet.
+                # Widen back to full uncertainty — the low could still change.
+                time_decay_multiplier = 1.0
+            elif lst_hour >= 12:
+                time_decay_multiplier = 0.3    # after noon: morning low is done, temp is rising
             elif lst_hour >= 8:
                 time_decay_multiplier = 0.5    # 8 AM–noon: low very likely passed
             elif lst_hour >= 4:
