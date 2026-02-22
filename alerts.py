@@ -9,7 +9,7 @@ import requests
 from datetime import datetime, timedelta
 from config import (
     CITIES, TIER1_CITIES,
-    SENDGRID_API_KEY, ALERT_FROM_EMAIL, ALERT_TO_EMAIL,
+    SENDGRID_API_KEY, ALERT_FROM_EMAIL, ALERT_TO_EMAIL, ALERT_TO_EMAIL_2,
     log, _et_now,
 )
 from analysis import _get_model_data
@@ -267,6 +267,10 @@ def send_email(message, subject=None):
         now     = datetime.now()
         subject = f"Kalshi Climate Bot — {now.strftime('%b %d')} {now.strftime('%I:%M %p')}"
 
+    recipients = [{"email": ALERT_TO_EMAIL}]
+    if ALERT_TO_EMAIL_2:
+        recipients.append({"email": ALERT_TO_EMAIL_2})
+
     try:
         response = requests.post(
             "https://api.sendgrid.com/v3/mail/send",
@@ -275,7 +279,7 @@ def send_email(message, subject=None):
                 "Content-Type":  "application/json",
             },
             json={
-                "personalizations": [{"to": [{"email": ALERT_TO_EMAIL}]}],
+                "personalizations": [{"to": recipients}],
                 "from":            {"email": ALERT_FROM_EMAIL},
                 "subject":         subject,
                 "content":         [{"type": "text/plain", "value": message}],

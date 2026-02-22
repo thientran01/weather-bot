@@ -19,6 +19,7 @@ KALSHI_API_KEY   = os.getenv("KALSHI_API_KEY")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL")   # must be verified with SendGrid
 ALERT_TO_EMAIL   = os.getenv("ALERT_TO_EMAIL")
+ALERT_TO_EMAIL_2 = os.getenv("ALERT_TO_EMAIL_2")
 # Set SEND_TEST_EMAIL=true in Railway (or .env) to fire one test email on startup.
 SEND_TEST_EMAIL  = os.getenv("SEND_TEST_EMAIL", "").lower() == "true"
 WEATHERAPI_KEY   = os.getenv("WEATHERAPI_KEY")     # weatherapi.com — free tier is sufficient
